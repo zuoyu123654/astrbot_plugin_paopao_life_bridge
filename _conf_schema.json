@@ -1,0 +1,62 @@
+{
+  "enable": {
+    "description": "启用生活桥",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉后所有跨端读写都会静默跳过，QQ 和 B站 回到互不相认的状态。"
+  },
+  "owner_qq": {
+    "description": "老大的 QQ 号",
+    "type": "string",
+    "default": "1792559819",
+    "hint": "身份归一的锚点。B站 私信里只有这个人会被认成老大本人。"
+  },
+  "owner_bili": {
+    "description": "老大的 B站 UID",
+    "type": "string",
+    "default": "1252860980",
+    "hint": "和上面那条组成同一个人的两个身份。"
+  },
+  "enable_bili_recall": {
+    "description": "让 B站 侧读到中枢记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "评论区只给 shareable 和 bot_self；私信里如果对方是老大，才给 private_pair。"
+  },
+  "enable_journal_ingest": {
+    "description": "把日记 / 梦境 / 主动消息写进中枢",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭：陪伴插件自己的旧桥已经在往中枢写日记，再开一份会重复。只有旧桥不可用时才打开。"
+  },
+  "enable_qq_supplement": {
+    "description": "给 QQ 私聊补充 B站 侧记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "只返回 B站 来源的条目，不会把 QQ 自己的记忆重复注入一遍。"
+  },
+  "bili_recall_top_k": {
+    "description": "B站 侧每次最多读几条",
+    "type": "int",
+    "default": 5,
+    "hint": "评论区每条回复都会查一次，别开太大。"
+  },
+  "bili_recall_max_chars": {
+    "description": "B站 侧注入的字数上限",
+    "type": "int",
+    "default": 700,
+    "hint": "超出的条目会被略过，不会截断单条。"
+  },
+  "qq_recall_top_k": {
+    "description": "QQ 私聊补充几条",
+    "type": "int",
+    "default": 3,
+    "hint": "和内置记忆一起注入，多了会挤掉 QQ 自己的上下文。"
+  },
+  "debug": {
+    "description": "调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后每次读写都会打一行摘要。"
+  }
+}
