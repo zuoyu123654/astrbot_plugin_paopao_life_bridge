@@ -8,7 +8,7 @@ desc: >
   2. 给 B站 AI Bot 提供只读接口，按场合（评论区 / 私信）读到中枢里属于她的那部分；
   3. 给 QQ 私聊补充 B站 侧发生的事，避免只记得 QQ。
   所有写入都带幂等键，重复触发不会写两条。任何失败都只记日志，不影响主回复。
-version: 1.1.0
+version: 1.1.1
 author: paopao
 repo: https://github.com/zuoyu123654/astrbot_plugin_paopao_life_bridge
 astrbot_version: ">=4.27"
