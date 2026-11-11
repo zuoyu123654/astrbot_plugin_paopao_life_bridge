@@ -134,7 +134,7 @@ bridge = context.get_registered_star("paopao_life_bridge").star_cls
 block = await bridge.recall_for_bili(
     query,                      # 要对齐的语义，一般是当前这条消息
     channel="comment",          # "comment" / "private" / "live"
-    user_id="1252860980",       # B站 UID
+    user_id="<主人的 B站 UID>",   # B站 UID
     oid="123456",               # 视频/动态 oid，可空
     thread_id="bili:...",       # 评论线，可空
 )
@@ -161,7 +161,7 @@ bridge.health()   # {"enabled":..., "memory_service":..., "companion_provider":.
 重启后日志里应该有：
 
 ```
-[LifeBridge] self-check memory=ok companion=ok owner_qq=1792559819 owner_bili=1252860980
+[LifeBridge] self-check memory=ok companion=ok owner_qq=<你的QQ> owner_bili=<你的UID>
 ```
 
 - `memory=missing` → 中枢没装 / 没启用 / 服务名不是 `service`
