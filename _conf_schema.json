@@ -6,16 +6,16 @@
     "hint": "关掉后所有跨端读写都会静默跳过，QQ 和 B站 回到互不相认的状态。"
   },
   "owner_qq": {
-    "description": "老大的 QQ 号",
+    "description": "主人的 QQ 号（必填）",
     "type": "string",
-    "default": "1792559819",
-    "hint": "身份归一的锚点。B站 私信里只有这个人会被认成老大本人。"
+    "default": "",
+    "hint": "身份归一的锚点，必填。留空时 B站 私信里认不出主人，private_pair 一条都读不到。"
   },
   "owner_bili": {
-    "description": "老大的 B站 UID",
+    "description": "主人的 B站 UID（必填）",
     "type": "string",
-    "default": "1252860980",
-    "hint": "和上面那条组成同一个人的两个身份。"
+    "default": "",
+    "hint": "和上面那条组成同一个人的两个身份，必填。必须和 B站 AI Bot 的 OWNER_MID 一致。"
   },
   "enable_bili_recall": {
     "description": "让 B站 侧读到中枢记忆",
