@@ -24,7 +24,7 @@ from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.1"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -172,6 +172,16 @@ class PaopaoLifeBridge(Star):
             self.owner_qq or "?",
             self.owner_bili or "?",
         )
+        missing = [
+            name for name, value in (("owner_qq", self.owner_qq), ("owner_bili", self.owner_bili))
+            if not value
+        ]
+        if missing:
+            logger.warning(
+                "[LifeBridge] %s 还没填 —— 这是必填项。留空时 B站 私信里认不出主人，"
+                "private_pair 的记忆一条都读不到",
+                " / ".join(missing),
+            )
 
     async def terminate(self):
         api = self._companion_api
@@ -507,6 +517,23 @@ class PaopaoLifeBridge(Star):
             self.last_error = f"remember_bili: {exc}"
             logger.warning(f"[生活桥] 写 B站 事件失败：{exc}")
             return ""
+
+    async def has_memory(self, memory_id: str) -> bool:
+        """中枢里有没有这条记忆。给「别重复写」用。"""
+        mid = _clean(memory_id, 160)
+        if not mid:
+            return False
+        service = self._memory_service()
+        if service is None:
+            return False
+        try:
+            store = getattr(service, "store", None)
+            getter = getattr(store, "get_memory", None)
+            if not callable(getter):
+                return False
+            return await getter(mid) is not None
+        except Exception:
+            return False
 
     def health(self) -> dict[str, Any]:
         """给文档里的健康检查用。"""
