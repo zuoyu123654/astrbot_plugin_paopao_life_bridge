@@ -1,4 +1,4 @@
-"""泡泡生活桥 —— 把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份。
+﻿"""泡泡生活桥 —— 把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份。
 
 设计要点（改动前先读这一段）：
 
@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.4.2"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -462,7 +462,7 @@ class PaopaoLifeBridge(Star):
             # 问「我在干嘛」时补一条桌面上刚看到的。memory_companion 自己的检索
             # 对口语化短问句召回不高，光靠它她答不上来，就成「桌宠记忆没通过去」了。
             if any(hint in query for hint in ACTIVITY_HINTS):
-                for item in await self._recent_pet_vision(limit=2, hours=6.0):
+                for item in await self._recent_pet_vision(limit=1, hours=6.0):
                     content = _clean(item.get("content"), 400)
                     if not content:
                         continue
@@ -836,11 +836,19 @@ class PaopaoLifeBridge(Star):
         return f"- 老大：{item.get('user', '')}｜我：{item.get('reply', '')}"
 
     @staticmethod
-    def _decorate(scenario: str, text: str) -> str:
+    def _decorate(scenario: str, text: str, at: float = 0.0) -> str:
         # 标签里带「老大在做什么」，是因为人问的是「我在干嘛」——
         # 只写「桌面上看到」检索不到，写清楚这是什么才认得出来。
+        # 再带上时刻：一晚攒好几条，她不看时间就会把几条都列出来。
         label = "桌面上｜老大在做什么" if scenario == "vision" else "桌面上聊过"
-        return _clean(f"【{label}】{text}", MAX_CONTENT)
+        stamp = ""
+        if at:
+            try:
+                stamp = datetime.fromtimestamp(float(at)).strftime("%H:%M")
+            except (TypeError, ValueError, OSError):
+                stamp = ""
+        head = f"【{label}·{stamp}】" if stamp else f"【{label}】"
+        return _clean(f"{head}{text}", MAX_CONTENT)
 
     def _digest_label(self, scenario: str) -> str:
         return "识屏" if scenario == "vision" else "聊天"
@@ -874,24 +882,29 @@ class PaopaoLifeBridge(Star):
         直接拼原文只会留下「框选屏幕给我看」这种机器视角，以后问「我在干嘛」检索不到。
         聊天单条不总结，省一次 token（聊天内容本身就有信息）。
         """
+        first_epoch = float(items[0].get("epoch") or 0.0)
         if len(items) == 1 and scenario != "vision":
             item = items[0]
-            return self._decorate(scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}")
+            return self._decorate(
+                scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}", first_epoch
+            )
 
         limit = self._int("pet_summary_max_chars", 320, 80, 1200)
         lines = "\n".join(self._format_item(scenario, it) for it in items)
         if not self._bool("pet_summary_enabled", True):
-            return self._decorate(scenario, _clean(lines.replace("\n", " "), limit))
+            return self._decorate(scenario, _clean(lines.replace("\n", " "), limit), first_epoch)
 
         template = CHAT_SUMMARY_PROMPT if scenario == "chat" else VISION_SUMMARY_PROMPT
         text = await self._call_llm(template.format(limit=limit, lines=lines))
         if text:
-            return self._decorate(scenario, text)
+            return self._decorate(scenario, text, first_epoch)
         # 模型不可用 —— 拼原文，宁可难看也不丢
         if len(items) == 1:
             item = items[0]
-            return self._decorate(scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}")
-        return self._decorate(scenario, _clean(lines.replace("\n", " "), limit))
+            return self._decorate(
+                scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}", first_epoch
+            )
+        return self._decorate(scenario, _clean(lines.replace("\n", " "), limit), first_epoch)
 
     async def _flush_pet(self, scenario: str, reason: str = "") -> None:
         """把缓冲里的一批写进中枢。并发进来只会有一个真的执行。"""
@@ -1229,6 +1242,8 @@ class PaopaoLifeBridge(Star):
                 "【你记得的其他场合（同一份记忆，不是这次对话）】\n"
                 "这些是你真实经历过的：QQ 里聊过的、B站 上做过的、桌面上看到过的。\n"
                 "可以像回忆一样自然提起来，别念清单，也别说「记忆里写着」。\n"
+                "每条开头【…·HH:MM】是发生的时刻。有人问「我在干嘛」「我在做什么」这类，\n"
+                "**只回答最新那条**，不要把这几个时间段都列出来。\n"
             )
             return block + "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
