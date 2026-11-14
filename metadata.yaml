@@ -16,7 +16,7 @@ desc: >
   5. B站 补丁守卫：B站 AI Bot 每次升级都会把「和中枢互通」的补丁冲掉（已经踩两次），
      生活桥启动后直接在内存里给它包两个方法（写：看片/发动态进中枢；读：回评论时读中枢），
      不改文件、不用重启，最多 2 分钟自动恢复。状态看 /health 的 bili_patch。
-version: 1.4.1
+version: 1.4.2
 author: paopao
 repo: https://github.com/zuoyu123654/astrbot_plugin_paopao_life_bridge
 astrbot_version: ">=4.27"
