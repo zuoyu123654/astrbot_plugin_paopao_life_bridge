@@ -1,6 +1,6 @@
 # 泡泡生活桥（paopao_life_bridge）
 
-把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份，让 QQ / B站 / DSH 是同一个她。
+把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份，让 QQ / B站 / 桌宠 / DSH 是同一个她。
 
 这个插件**不生产记忆**，只做翻译。
 
@@ -8,10 +8,11 @@
 
 ## 它解决什么
 
-没有它的时候，是三个她：
+没有它的时候，是四个她：
 
 - QQ 里的她，有生活（日程、心情、日记）也有记忆
 - B站 里的她，只有自己的看片记录，不知道 QQ 聊过什么，也不知道你今天累不累
+- 桌宠里的她，只记得自己那份会话，看不见别处
 - DSH 里的她，谁也看不见
 
 装完之后是一条链：
@@ -25,14 +26,15 @@
                                  ▼
                         MemoryCompanion  ← 唯一事实出口
                                  │
-                   ┌─────────────┼─────────────┐
-                   ▼             ▼             ▼
-                 QQ            B站            DSH
+              ┌──────────┬───────┴───────┬──────────┐
+              ▼          ▼               ▼          ▼
+             QQ        B站            桌宠        DSH
+                                    （记忆信箱 127.0.0.1:9889）
 ```
 
 ---
 
-## 三个功能
+## 四个功能
 
 ### 1. 给 B站 侧读中枢（`recall_for_bili`）
 
@@ -67,6 +69,42 @@ QQ 私聊召回时，它把**中枢里 B站 来源**的条目补进去，避免�
   - `observed`——只看到别人的东西
 
 写不准她会吹牛说「我看了」，被追问细节就露馅。
+
+### 4. 记忆信箱：桌宠和 DSH 也接进来（1.2.0 新增）
+
+在 AstrBot 进程里开一个只监听 `127.0.0.1:9889` 的小 HTTP 服务。
+桌宠网关和 DSH 都通过它读写，最终仍然落回 `service` 接口 —— 谁都不碰数据库文件。
+
+| 方法 | 路径 | 谁用 |
+|---|---|---|
+| POST | `/pet/inbox` | 桌宠网关推一轮对话 |
+| POST | `/memory/recall` | 桌宠 / DSH 查记忆 |
+| POST | `/memory/remember` | DSH 写记忆 |
+| GET | `/health` | 排障 |
+
+可见性按来源定，写的时候定死，读的时候只过滤：
+
+| 来源 | visibility | 谁能读 |
+|---|---|---|
+| 桌宠识屏 | `bot_self` | 所有端 |
+| 桌宠聊天 | `private_pair` | 只有老大本人 |
+| DSH 对话 | `private_pair` | 同上 |
+| DSH `--self` | `bot_self` | 所有端 |
+
+写入有节流（太短不记、同句 30 分钟内只记一次、聊天 120 秒一条、识屏 20 秒一条），
+不然中枢会被桌面的口水话淹掉。
+
+自带一个命令行客户端（只用标准库）：
+
+```powershell
+$py  = "<AstrBot>\venv\Scripts\python.exe"
+$cli = "<AstrBot>\data\plugins\paopao_life_bridge\tools\paopao_memory.py"
+
+& $py $cli recall "老大最近在忙什么" --limit 5
+& $py $cli remember "老大说周末想去看海" --tags 约定 --importance 0.7
+& $py $cli remember "我把桌宠接进中枢了" --self
+& $py $cli health
+```
 
 ---
 
@@ -117,6 +155,23 @@ WHERE visibility = 'bot_self' GROUP BY visibility, source_plugin;
 | `bili_recall_top_k` | `5` | B站 侧每次最多读几条 |
 | `bili_recall_max_chars` | `700` | B站 侧注入的字数上限（整条取舍，不截断） |
 | `qq_recall_top_k` | `3` | QQ 私聊补充几条 |
+| `enable_http` | `true` | 打开记忆信箱（桌宠 / DSH 靠它） |
+| `http_host` | `127.0.0.1` | **不要改成 0.0.0.0** |
+| `http_port` | `9889` | 记忆信箱端口 |
+| `http_token` | 空 | 填了以后请求要带 `X-Paopao-Token` |
+| `enable_pet_ingest` | `true` | 桌宠的对话写进中枢 |
+| `enable_pet_recall` | `true` | 桌宠能读中枢 |
+| `enable_external_write` | `true` | 允许 DSH 写记忆 |
+| `pet_min_user_chars` | `4` | 太短不记 |
+| `pet_dedupe_seconds` | `1800` | 同一句多久内不重复记 |
+| `pet_min_interval_seconds` | `120` | 桌宠聊天写入间隔 |
+| `pet_vision_min_interval_seconds` | `20` | 桌宠识屏写入间隔 |
+| `pet_chat_importance` | `0.5` | 桌宠聊天记忆的重要度 |
+| `pet_vision_importance` | `0.55` | 桌宠识屏记忆的重要度 |
+| `pet_recall_top_k` | `5` | 桌宠 / DSH 每次读几条 |
+| `pet_recall_max_chars` | `800` | 桌宠 / DSH 注入的字数上限 |
+| `pet_noise_markers` | `[]` | 含这些词的桌宠输入不记（挡系统播报） |
+| `pet_exclude_memory_types` | `[]` | 桌宠读记忆时排除的类型 |
 | `debug` | `false` | 每次读写打一行摘要 |
 
 `owner_qq` / `owner_bili` 填错不会报错，只会表现为「B站 私信里的她把你当陌生人」。这是最难查的一种。
@@ -161,11 +216,13 @@ bridge.health()   # {"enabled":..., "memory_service":..., "companion_provider":.
 重启后日志里应该有：
 
 ```
-[LifeBridge] self-check memory=ok companion=ok owner_qq=<你的QQ> owner_bili=<你的UID>
+[LifeBridge] 记忆信箱已监听 http://127.0.0.1:9889
+[LifeBridge] self-check memory=ok companion=ok mailbox=ok owner_qq=<你的QQ> owner_bili=<你的UID>
 ```
 
 - `memory=missing` → 中枢没装 / 没启用 / 服务名不是 `service`
 - `companion=missing` → 陪伴插件版本太老，或没有 `extension_api`
+- `mailbox=off` → 端口被占 / `enable_http=false` / 没有 aiohttp（只影响桌宠和 DSH）
 
 ---
 
@@ -187,11 +244,14 @@ bridge.health()   # {"enabled":..., "memory_service":..., "companion_provider":.
 - **生活只到「天」粒度**：陪伴插件推的是已完成的日记/梦境，不是实时状态
 - **B站 评论区永远是半个她**：公开场合只给 `bot_self` + `shareable`，这是设计
 - **QQ 群接不上 B站**：官方 Provider 的 `read` 只在已授权私聊调用
+- **DSH 侧要她自己调**：没有自动注入，靠 `AGENT.md` 里的约定 + 命令行客户端。要做成全自动得另写一个 DSH 插件
 
 ---
 
 ## 版本
 
 - 1.0.0 — 初版。三个功能：B站 读、QQ 补、B站 写回。
+- 1.1.x — 补丁：`_plugin_data_dir` 重复定义、owner 校验、配置 BOM 兼容。
+- 1.2.0 — 加记忆信箱（本地 HTTP 9889）：桌宠和 DSH 接进来。识屏记 `bot_self`、聊天记 `private_pair`，带写入节流和去重；附命令行客户端 `tools/paopao_memory.py`。
 
 兼容：AstrBot >= 4.27，陪伴插件 >= 7.0.7，记忆中枢 >= 1.10.0。
