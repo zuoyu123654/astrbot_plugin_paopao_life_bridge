@@ -28,6 +28,7 @@ PyInstaller 程序，绝对不能碰那个 .db。所有写入必须回到 AstrBo
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import time
@@ -43,7 +44,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -65,8 +66,53 @@ PET_SCENARIO_KIND = {
     "chat": "pet_chat",       # 桌面上聊的天      → private_pair，只对老大本人
 }
 
+#: 攒批总结时用的 memory_type（和逐条写入的区分开，方便按类型过滤）
+PET_DIGEST_TYPE = {
+    "chat": "pet_chat_digest",
+    "vision": "pet_vision_digest",
+}
+
+#: 出现这些词就不攒批了，当场单独写一条。错过一句「我答应你」的代价太大。
+IMPORTANT_MARKERS = (
+    "记住", "别忘", "约定", "答应", "保证", "发誓", "承诺",
+    "喜欢", "讨厌", "生日", "过敏", "不能吃", "习惯",
+    "重要", "决定", "计划", "打算", "以后", "明天",
+    "怕", "担心", "难过", "想念", "舍不得",
+)
+
+CHAT_SUMMARY_PROMPT = """你在帮她整理记忆。下面是刚才在电脑桌面上，老大和她聊的内容。
+
+请把这批对话压缩成一条她以后能回想起来的记忆，要求：
+1. 只写真实出现过的内容，不许补充、不许推测、不许编
+2. 用第三人称写「老大」，她自己用「我」，像回忆，不要写成对话格式
+3. 保留具体的东西：人名、物件、数字、时间、决定、情绪
+4. 合并重复和寒暄，不要一条一条列
+5. 不超过 {limit} 字，一段话，不要分点、不要标题、不要任何解释
+
+对话：
+{lines}
+
+只输出那段记忆。"""
+
+VISION_SUMMARY_PROMPT = """你在帮她整理记忆。下面是刚才她在电脑桌面上亲眼看到的屏幕内容，以及她当时的反应。
+
+请压缩成一条她以后能回想起来的记忆，要求：
+1. 只写真的出现在屏幕上的东西，不许编
+2. 写清楚「看到了什么」和「我当时说了什么」
+3. 保留具体的名称、数字、颜色、屏幕上的文字
+4. 合并重复的截图
+5. 不超过 {limit} 字，一段话，不要分点、不要标题、不要任何解释
+
+记录：
+{lines}
+
+只输出那段记忆。"""
+
 MAX_CONTENT = 1200
 _SPACES = re.compile(r"\s+")
+_PET_META_HINT = re.compile(r"参考元数据[:：]\s*([^）)]+)")
+#: 桌宠识屏时会把自己的提示词模板一起塞进 user 字段，这些话不是老大说的，不能当记忆。
+_PET_PROMPT_MARKERS = ("这是老大当前的屏幕截图", "（身份提示", "(身份提示", "用你的人设口吻回应")
 
 
 def _clean(value: Any, limit: int = 200) -> str:
@@ -101,10 +147,18 @@ class PaopaoLifeBridge(Star):
         self._http_runner: Any = None
         self._http_site: Any = None
         self.pet_write_count: int = 0
+        self.pet_digest_count: int = 0
         self.dsh_write_count: int = 0
         self.pet_skip_count: int = 0
         self._pet_seen: dict[str, float] = {}
         self._pet_last_write: dict[str, float] = {"chat": 0.0, "vision": 0.0}
+
+        # 攒批总结：先进缓冲，够数 / 够久 / 聊完了才压成一条写进中枢
+        self._pet_buffer: dict[str, list[dict[str, Any]]] = {"chat": [], "vision": []}
+        self._pet_buffer_since: dict[str, float] = {"chat": 0.0, "vision": 0.0}
+        self._pet_last_inbox: dict[str, float] = {"chat": 0.0, "vision": 0.0}
+        self._pet_flush_lock: asyncio.Lock | None = None
+        self._pet_flush_task: Any = None
 
     # ══════════════════════════════════════════
     #  配置
@@ -212,6 +266,8 @@ class PaopaoLifeBridge(Star):
             return
         ok = await self._register_provider()
         await self._start_http()
+        if self._pet_flush_task is None:
+            self._pet_flush_task = asyncio.create_task(self._pet_flush_loop())
         try:
             has_memory = self._memory_service() is not None
         except Exception:
@@ -236,6 +292,7 @@ class PaopaoLifeBridge(Star):
             )
 
     async def terminate(self):
+        await self._stop_pet_flush()
         await self._stop_http()
         api = self._companion_api
         registration = self._registration
@@ -635,44 +692,265 @@ class PaopaoLifeBridge(Star):
         haystack = text or ""
         return any(str(marker) and str(marker) in haystack for marker in raw)
 
-    def _pet_should_skip(self, scenario: str, user_text: str) -> str:
-        """返回跳过原因，空串表示可以写。"""
+    def _pet_should_skip(self, scenario: str, user_text: str, reply: str = "") -> str:
+        """返回跳过原因，空串表示可以收。
+
+        1.3.0 起这里不再做「时间间隔」节流 —— 节流改由攒批总结完成
+        （一批压成一条，本身就把频率降下来了，而且不丢内容）。
+        """
         if len(user_text) < self._int("pet_min_user_chars", 4, 1, 200):
             return "too_short"
         if self._is_noise(user_text):
             return "noise"
         now = time.time()
-        # 同一句话在这个窗口里写过就不写第二次（桌宠重发、点两下都会触发）
+        # 同一句话在这个窗口里收过就不再收（桌宠重发、点两下都会触发）。
+        # 带上 reply 是因为识屏的 user 清洗后都长一个样，只靠它会把每次截图都判成重复。
         seen_ttl = self._int("pet_dedupe_seconds", 1800, 0, 86400)
-        key = hashlib.sha1(f"{scenario}|{user_text[:120]}".encode("utf-8")).hexdigest()
+        raw_key = f"{scenario}|{user_text[:120]}|{(reply or '')[:60]}"
+        key = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
         last = self._pet_seen.get(key, 0.0)
         if seen_ttl and now - last < seen_ttl:
             return "duplicate"
-        # 场景级节流：连着聊天不至于把中枢刷满
-        gap = self._int(
-            "pet_min_interval_seconds" if scenario == "chat" else "pet_vision_min_interval_seconds",
-            120 if scenario == "chat" else 20,
-            0,
-            86400,
-        )
-        if gap and now - self._pet_last_write.get(scenario, 0.0) < gap:
-            return "throttled"
-        # 记下来，真正写成功也还会再更新一次时间
         if seen_ttl:
             self._pet_seen[key] = now
         return ""
 
+    def _is_important(self, text: str) -> bool:
+        """这句话值得当场单独记，不用等攒批。"""
+        if not self._bool("pet_important_direct", True):
+            return False
+        return any(marker in (text or "") for marker in IMPORTANT_MARKERS)
+
+    def _strip_pet_prompt(self, user_text: str) -> str:
+        """识屏时桌宠会把「这是老大当前的屏幕截图。用你的人设口吻回应…」这类
+        提示词模板塞进 user 字段。那不是老大说的话，不能当记忆写进去，
+        否则她会「记得」一堆她自己收到的指令。
+
+        模板里唯一有价值的是「参考元数据：前台应用 XXX」，留下来。
+        """
+        text = user_text or ""
+        if not any(marker in text for marker in _PET_PROMPT_MARKERS):
+            return text
+        meta = _PET_META_HINT.search(text)
+        hint = f"（{_squash(meta.group(1), 60)}）" if meta else ""
+        return _squash(f"老大框选了一块屏幕给我看{hint}", 200)
+
+    # ══════════════════════════════════════════
+    #  记忆信箱 · 攒批总结
+    # ══════════════════════════════════════════
+
+    @staticmethod
+    def _format_item(scenario: str, item: dict[str, Any]) -> str:
+        if scenario == "vision":
+            return f"- 屏幕上：{item.get('user', '')}｜我：{item.get('reply', '')}"
+        return f"- 老大：{item.get('user', '')}｜我：{item.get('reply', '')}"
+
+    @staticmethod
+    def _decorate(scenario: str, text: str) -> str:
+        label = "桌面上看到" if scenario == "vision" else "桌面上聊过"
+        return _clean(f"【{label}】{text}", MAX_CONTENT)
+
+    def _digest_label(self, scenario: str) -> str:
+        return "识屏" if scenario == "vision" else "聊天"
+
+    async def _call_llm(self, prompt: str) -> str:
+        """调一次模型做压缩。拿不到模型就返回空串，上层用原文兜底。"""
+        try:
+            provider = None
+            provider_id = _clean(self._cfg("pet_summary_provider_id", ""), 80)
+            if provider_id:
+                provider = await self.context.provider_manager.get_provider_by_id(provider_id)
+            if provider is None:
+                provider = await self.context.get_using_provider_async()
+            if provider is None:
+                return ""
+            timeout = self._int("pet_summary_timeout", 45, 5, 180)
+            resp = await asyncio.wait_for(provider.text_chat(prompt=prompt), timeout=timeout)
+            text = getattr(resp, "completion_text", "") or ""
+            return _clean(text, 1500)
+        except asyncio.TimeoutError:
+            logger.warning("[生活桥] 桌宠记忆总结超时，用原文兜底")
+            return ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[生活桥] 桌宠记忆总结失败（用原文兜底）：{exc}")
+            return ""
+
+    async def _compose_digest(self, scenario: str, items: list[dict[str, Any]]) -> str:
+        """把一批对话压成一条记忆。单条就不调模型了，省一次 token。"""
+        if len(items) == 1:
+            item = items[0]
+            return self._decorate(scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}")
+
+        limit = self._int("pet_summary_max_chars", 320, 80, 1200)
+        lines = "\n".join(self._format_item(scenario, it) for it in items)
+        if not self._bool("pet_summary_enabled", True):
+            return self._decorate(scenario, _clean(lines.replace("\n", " "), limit))
+
+        template = CHAT_SUMMARY_PROMPT if scenario == "chat" else VISION_SUMMARY_PROMPT
+        text = await self._call_llm(template.format(limit=limit, lines=lines))
+        if text:
+            return self._decorate(scenario, text)
+        # 模型不可用 —— 拼原文，宁可难看也不丢
+        return self._decorate(scenario, _clean(lines.replace("\n", " "), limit))
+
+    async def _flush_pet(self, scenario: str, reason: str = "") -> None:
+        """把缓冲里的一批写进中枢。并发进来只会有一个真的执行。"""
+        if self._pet_flush_lock is None:
+            self._pet_flush_lock = asyncio.Lock()
+        async with self._pet_flush_lock:
+            items = self._pet_buffer.get(scenario) or []
+            if not items:
+                return
+            self._pet_buffer[scenario] = []
+            self._pet_buffer_since[scenario] = 0.0
+            try:
+                await self._write_digest(scenario, items, reason)
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"flush_pet({scenario}): {exc}"
+                logger.warning(f"[生活桥] 桌宠{self._digest_label(scenario)}入中枢失败：{exc}")
+
+    async def _write_digest(self, scenario: str, items: list[dict[str, Any]], reason: str = "") -> bool:
+        service = self._memory_service()
+        if service is None:
+            return False
+        body = await self._compose_digest(scenario, items)
+        if not body:
+            return False
+        first_epoch = int(items[0].get("epoch") or time.time())
+        occurred_at = datetime.fromtimestamp(first_epoch).isoformat()
+        memory_type = PET_DIGEST_TYPE[scenario]
+        single = len(items) == 1
+
+        if scenario == "vision":
+            # 她自己的眼睛看到的 → bot_self，所有端都能提起来
+            await service.record_external_event(
+                content=body,
+                memory_type=memory_type,
+                visibility="bot_self",
+                scope="private",
+                platform="desktop_pet",
+                session_id="pet:desktop",
+                reality_level="bot_action",
+                lifecycle="stable_memory",
+                confidence=0.86,
+                importance=self._float("pet_vision_importance", 0.55, 0.1, 1.0),
+                review_status="auto",
+                tags=["桌面", "识屏"],
+                metadata={
+                    "life_bridge": PROVIDER_ID,
+                    "pet_scenario": scenario,
+                    "batch": len(items),
+                    "flush_reason": reason,
+                },
+                source_plugin="paopao_pet",
+                occurred_at=occurred_at,
+                memory_id=f"pet:vision:{first_epoch}",
+            )
+        else:
+            # 桌面上聊的天属于私聊，绑到老大身上：QQ 私聊和 B站 私信能读到，群里读不到
+            result = await service.record_external_memory(
+                user_id=self.owner_qq,
+                content=body,
+                memory_type=memory_type,
+                source_plugin="paopao_pet",
+                occurred_at=occurred_at,
+                idempotency_key=f"pet:chat:{first_epoch}",
+                memory_id=f"pet:chat:{first_epoch}",
+                importance=self._float("pet_chat_importance", 0.5, 0.1, 1.0),
+                confidence=0.82,
+                tags=["桌面", "聊天"],
+                metadata={
+                    "life_bridge": PROVIDER_ID,
+                    "pet_scenario": scenario,
+                    "batch": len(items),
+                    "flush_reason": reason,
+                },
+            )
+            if not (result or {}).get("ok"):
+                raise RuntimeError(str((result or {}).get("error_code") or "record_failed"))
+
+        self._pet_last_write[scenario] = time.time()
+        self.pet_write_count += 1
+        if not single:
+            self.pet_digest_count += 1
+        self.write_count += 1
+        self.last_write_at = time.time()
+        logger.info(
+            "[LifeBridge] 桌宠%s入中枢（%d 条 → %d 字，%s）",
+            self._digest_label(scenario),
+            len(items),
+            len(body),
+            reason or "-",
+        )
+        if self.debug:
+            logger.info(f"[生活桥] {body[:80]}")
+        return True
+
+    async def _maybe_flush(self, scenario: str) -> None:
+        buf = self._pet_buffer.get(scenario) or []
+        if not buf:
+            return
+        max_items = self._int(f"pet_{scenario}_summary_items", 6 if scenario == "chat" else 4, 1, 50)
+        max_minutes = self._int(f"pet_{scenario}_summary_max_minutes", 8 if scenario == "chat" else 15, 1, 600)
+        hard_cap = self._int("pet_buffer_max_items", 24, 2, 200)
+        started = self._pet_buffer_since.get(scenario) or 0.0
+        age_minutes = (time.time() - started) / 60.0 if started else 0.0
+        if len(buf) >= max_items or len(buf) >= hard_cap or age_minutes >= max_minutes:
+            await self._flush_pet(scenario, reason="batch")
+
+    async def _pet_flush_loop(self) -> None:
+        """每 15 秒看一眼：聊停了就把这批压成一条，别让它一直在缓冲里。"""
+        while True:
+            try:
+                await asyncio.sleep(15)
+                now = time.time()
+                for scenario in ("chat", "vision"):
+                    if not self._pet_buffer.get(scenario):
+                        continue
+                    idle = self._int(
+                        f"pet_{scenario}_summary_idle_seconds",
+                        90 if scenario == "chat" else 120,
+                        10,
+                        3600,
+                    )
+                    if now - (self._pet_last_inbox.get(scenario) or 0.0) >= idle:
+                        await self._flush_pet(scenario, reason="idle")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[生活桥] 桌宠缓冲检查失败：{exc}")
+
+    async def _stop_pet_flush(self) -> None:
+        task = self._pet_flush_task
+        self._pet_flush_task = None
+        if task is not None:
+            task.cancel()
+            # 用 gather(return_exceptions=True) 收尾，别把 CancelledError 漏到 terminate 上
+            try:
+                await asyncio.gather(task, return_exceptions=True)
+            except Exception:  # noqa: BLE001
+                pass
+        # 关之前把剩下的写完，别让最后几句丢在内存里
+        for scenario in ("chat", "vision"):
+            if self._pet_buffer.get(scenario):
+                try:
+                    await self._flush_pet(scenario, reason="shutdown")
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def ingest_pet(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """收下桌宠网关推来的一轮对话。
+        """收下桌宠网关推来的一轮对话，先进缓冲。
 
         可见性按场景分两种，这是隐私边界所在，别为了"方便"改：
           - vision（识屏）→ bot_self：她亲眼看到的桌面，别的端也能提
           - chat  （聊天）→ private_pair：只对老大本人，B站 评论区读不到
+
+        写入时机不再是「每句都写」：攒够条数 / 聊够时间 / 聊停了才压成一条。
+        一批压一条，既不会把中枢刷满，也不会像原来那样只留每 2 分钟的第一句。
         """
         if not self.enabled or not self._bool("enable_pet_ingest", True):
             return {"ok": False, "state": "disabled"}
-        service = self._memory_service()
-        if service is None:
+        if self._memory_service() is None:
             return {"ok": False, "state": "memory_missing"}
         scenario = _clean(payload.get("scenario"), 20).lower() or "chat"
         if scenario not in PET_SCENARIO_KIND:
@@ -681,7 +959,11 @@ class PaopaoLifeBridge(Star):
         reply = _squash(payload.get("assistant"), 2000)
         if not reply:
             return {"ok": False, "state": "no_reply"}
-        reason = self._pet_should_skip(scenario, user_text)
+        # 识屏的 user 里混着桌宠自己的提示词，先剥掉再记
+        user_text = self._strip_pet_prompt(user_text)
+        if len(user_text) < 2:
+            user_text = "老大框选了一块屏幕给我看"
+        reason = self._pet_should_skip(scenario, user_text, reply)
         if reason:
             self.pet_skip_count += 1
             if self.debug:
@@ -692,68 +974,23 @@ class PaopaoLifeBridge(Star):
             epoch = int(payload.get("ts") or time.time())
         except (TypeError, ValueError):
             epoch = int(time.time())
-        occurred_at = datetime.fromtimestamp(epoch).isoformat()
-        memory_type = PET_SCENARIO_KIND[scenario]
 
-        if scenario == "vision":
-            body = f"【电脑桌面·识屏】{user_text}｜我：{reply}"
-        else:
-            body = f"【电脑桌面·聊天】老大：{user_text}｜我：{reply}"
-        body = _clean(body, MAX_CONTENT)
+        self._pet_buffer[scenario].append({"user": user_text, "reply": reply, "epoch": epoch})
+        if not self._pet_buffer_since.get(scenario):
+            self._pet_buffer_since[scenario] = time.time()
+        self._pet_last_inbox[scenario] = time.time()
 
-        try:
-            if scenario == "vision":
-                # 她自己的眼睛看到的，挂在 bot_self 上，所有端都能提起来。
-                memory_id = f"pet:vision:{epoch}"
-                await service.record_external_event(
-                    content=body,
-                    memory_type=memory_type,
-                    visibility="bot_self",
-                    scope="private",
-                    platform="desktop_pet",
-                    session_id="pet:desktop",
-                    reality_level="bot_action",
-                    lifecycle="stable_memory",
-                    confidence=0.86,
-                    importance=self._float("pet_vision_importance", 0.55, 0.1, 1.0),
-                    review_status="auto",
-                    tags=["桌面", "识屏"],
-                    metadata={"life_bridge": PROVIDER_ID, "pet_scenario": scenario},
-                    source_plugin="paopao_pet",
-                    occurred_at=occurred_at,
-                    memory_id=memory_id,
-                )
-            else:
-                # 桌面上聊的天属于私聊，绑到老大身上：QQ 私聊和 B站 私信能读到，
-                # 群里和评论区读不到。走中枢那个更窄的 external_memory 接口。
-                result = await service.record_external_memory(
-                    user_id=self.owner_qq,
-                    content=body,
-                    memory_type=memory_type,
-                    source_plugin="paopao_pet",
-                    occurred_at=occurred_at,
-                    idempotency_key=f"pet:{epoch}",
-                    memory_id=f"pet:chat:{epoch}",
-                    importance=self._float("pet_chat_importance", 0.5, 0.1, 1.0),
-                    confidence=0.82,
-                    tags=["桌面", "聊天"],
-                    metadata={"life_bridge": PROVIDER_ID, "pet_scenario": scenario},
-                )
-                memory_id = str((result or {}).get("memory_id") or "")
-                if not (result or {}).get("ok"):
-                    raise RuntimeError(str((result or {}).get("error_code") or "record_failed"))
+        # 重要的话不留到批里 —— 当场写，晚一步可能就忘了
+        if self._is_important(f"{user_text}{reply}"):
+            await self._flush_pet(scenario, reason="important")
+            return {"ok": True, "state": "stored", "reason": "important"}
 
-            self._pet_last_write[scenario] = time.time()
-            self.pet_write_count += 1
-            self.write_count += 1
-            self.last_write_at = time.time()
-            if self.debug:
-                logger.info(f"[生活桥] 桌宠 {scenario} 已入中枢：{body[:40]}")
-            return {"ok": True, "state": "stored", "memory_id": memory_id}
-        except Exception as exc:  # noqa: BLE001
-            self.last_error = f"ingest_pet: {exc}"
-            logger.warning(f"[生活桥] 写桌宠记忆失败：{exc}")
-            return {"ok": False, "state": "error", "error": str(exc)}
+        await self._maybe_flush(scenario)
+        return {
+            "ok": True,
+            "state": "buffered",
+            "buffered": len(self._pet_buffer[scenario]),
+        }
 
     async def remember_external(
         self,
@@ -1029,6 +1266,8 @@ class PaopaoLifeBridge(Star):
             "writes": self.write_count,
             "reads": self.read_count,
             "pet_writes": self.pet_write_count,
+            "pet_digests": self.pet_digest_count,
+            "pet_buffered": {k: len(v) for k, v in self._pet_buffer.items()},
             "pet_skips": self.pet_skip_count,
             "external_writes": self.dsh_write_count,
             "last_write_at": self.last_write_at,
