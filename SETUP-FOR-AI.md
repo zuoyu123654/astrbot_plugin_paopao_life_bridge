@@ -104,8 +104,18 @@ paopao_life_bridge/
   "enable_external_write": true,
   "pet_min_user_chars": 4,
   "pet_dedupe_seconds": 1800,
-  "pet_min_interval_seconds": 120,
-  "pet_vision_min_interval_seconds": 20,
+  "pet_summary_enabled": true,
+  "pet_chat_summary_items": 6,
+  "pet_vision_summary_items": 4,
+  "pet_chat_summary_idle_seconds": 90,
+  "pet_vision_summary_idle_seconds": 120,
+  "pet_chat_summary_max_minutes": 8,
+  "pet_vision_summary_max_minutes": 15,
+  "pet_buffer_max_items": 24,
+  "pet_summary_max_chars": 320,
+  "pet_summary_provider_id": "",
+  "pet_summary_timeout": 45,
+  "pet_important_direct": true,
   "pet_chat_importance": 0.5,
   "pet_vision_importance": 0.55,
   "pet_recall_top_k": 5,
@@ -337,17 +347,47 @@ DSH 命令行 ┘
 
 **这是靠 visibility 字段挡的，不是靠提示词。** 别为了让某条记忆"更好用"改成 `shareable`。
 
-### 11.4 写入节流（不然中枢会被口水话淹掉）
+### 11.4 写入方式：攒批总结（1.3.0 起）
 
-| 键 | 默认 | 作用 |
+1.2.0 一开始是「每句话都写，但按时间节流」——120 秒只放过一条。实测下来这个设计是错的：
+老大在桌面上连聊五分钟，中枢里只留两三句，而且是**每一轮的开头**，不是内容，等于随机抽。
+
+1.3.0 改成：**先进缓冲，攒一批压成一条再写**。
+
+| 触发条件 | 键 | 默认 |
 |---|---|---|
-| `pet_min_user_chars` | 4 | 「嗯」「哦」这种不记 |
-| `pet_dedupe_seconds` | 1800 | 同一句话半小时内只记一次（桌宠会重发） |
-| `pet_min_interval_seconds` | 120 | 聊天连说十句只留第一条 |
-| `pet_vision_min_interval_seconds` | 20 | 识屏间隔短一些，但连拍也会被挡 |
+| 攒够条数 | `pet_chat_summary_items` / `pet_vision_summary_items` | 6 / 4 |
+| **聊停了**（最常用） | `pet_chat_summary_idle_seconds` / `pet_vision_summary_idle_seconds` | 90 / 120 |
+| 聊太久 | `pet_chat_summary_max_minutes` / `pet_vision_summary_max_minutes` | 8 / 15 |
+| 缓冲防爆 | `pet_buffer_max_items` | 24 |
+| 重要的话直通 | `pet_important_direct` | true |
 
-被挡掉的会返回 `{"ok": false, "state": "throttled"/"duplicate"/"too_short"}`，
+总结用 AstrBot 当前的对话模型（`pet_summary_provider_id` 可以单独指定一个便宜的），
+一批压成 200–350 字的一条记忆。**模型挂了就拼原文兜底，不会丢。**
+单条不调模型（省 token），直接写。
+
+实测：4 条对话 → 179 字一条，信息全保留、没编造。
+
+还有两个小过滤：
+
+- `pet_min_user_chars`（4）：太短的内容不收
+- `pet_dedupe_seconds`（1800）：同一句话半小时内只收一次（桌宠会重发、点两下）
+
+被挡掉的返回 `{"ok": false, "state": "duplicate"/"too_short"/"noise"}`，
 `/health` 里的 `pet_skips` 会加一。**这是正常的，不是坏了。**
+
+### 11.4.1 识屏的提示词要剥掉
+
+桌宠识屏时，会把**它自己的提示词模板**塞进 `user` 字段：
+
+```
+（参考元数据：老大当前前台应用为 Code.exe） 这是老大当前的屏幕截图。用你的人设口吻回应一两句就好……
+（身份提示：画面边缘或角落里如果有一个动漫风格的桌面宠物形象，那就是你自己「泡泡」……）
+```
+
+这些不是老大说的话。不剥掉的话，她会「记得」一堆自己收到的指令。
+`_strip_pet_prompt()` 会把它们换成「老大框选了一块屏幕给我看（前台是 Code.exe）」，
+只留下 `参考元数据` 里那个前台应用名。这是个真实的坑，别删这段逻辑。
 
 ### 11.5 桌宠那边怎么接
 
@@ -397,12 +437,15 @@ DSH 侧没有自动注入（那是另一套插件体系），靠她自己按需�
 
 | # | 怎么做 | 期望 |
 |---|---|---|
-| 1 | `Invoke-RestMethod http://127.0.0.1:9889/health` | `mailbox_listening: true`、`memory_service: true` |
-| 2 | 在桌宠里说一句长一点的闲话 | 网关日志出现 `注入跨端记忆 N 字`；`/health` 的 `pet_writes` +1 |
+| 1 | `Invoke-RestMethod http://127.0.0.1:9889/health` | `mailbox_listening: true`、`memory_service: true`、`version: 1.3.0` |
+| 2 | 在桌宠里聊三句，等 90 秒 | `/health` 的 `pet_buffered.chat` 从 3 变 0、`pet_writes` +1；日志出现 `桌宠聊天入中枢（3 条 → xxx 字，idle）` |
 | 3 | 在 QQ 私聊问「你刚才在桌面上跟老大聊什么了」 | 说得出桌宠那边的事 |
 
-第 3 条是四端互通的验收点。说不出来先看 `pet_writes` 有没有涨 ——
-没涨是被节流挡了，等 2 分钟再说一句。
+第 3 条是四端互通的验收点。说不出来先看 `pet_writes` 有没有涨：
+
+- 没涨，但 `pet_buffered` 有数 → 还在攒，等 90 秒
+- 两个都是 0、`pet_skips` 在涨 → 被去重挡了（那句话半小时内说过）
+- 报 `memory_missing` → 中枢没启用
 
 ### 11.8 关掉的办法
 
