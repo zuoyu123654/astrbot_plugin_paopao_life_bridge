@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import re
 import time
 from datetime import datetime
@@ -44,7 +45,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -160,6 +161,10 @@ class PaopaoLifeBridge(Star):
         self._pet_flush_lock: asyncio.Lock | None = None
         self._pet_flush_task: Any = None
 
+        # B站 AI Bot 补丁守卫（运行时打补丁，插件升级覆盖了也不怕）
+        self._bili_patch_task: Any = None
+        self._bili_patch_status: str = "未检查"
+
     # ══════════════════════════════════════════
     #  配置
     # ══════════════════════════════════════════
@@ -268,6 +273,8 @@ class PaopaoLifeBridge(Star):
         await self._start_http()
         if self._pet_flush_task is None:
             self._pet_flush_task = asyncio.create_task(self._pet_flush_loop())
+        if self._bili_patch_task is None:
+            self._bili_patch_task = asyncio.create_task(self._bili_patch_loop())
         try:
             has_memory = self._memory_service() is not None
         except Exception:
@@ -292,6 +299,14 @@ class PaopaoLifeBridge(Star):
             )
 
     async def terminate(self):
+        patch_task = self._bili_patch_task
+        self._bili_patch_task = None
+        if patch_task is not None:
+            patch_task.cancel()
+            try:
+                await asyncio.gather(patch_task, return_exceptions=True)
+            except Exception:  # noqa: BLE001
+                pass
         await self._stop_pet_flush()
         await self._stop_http()
         api = self._companion_api
@@ -1254,6 +1269,164 @@ class PaopaoLifeBridge(Star):
         )
         return web.json_response(result)
 
+    # ══════════════════════════════════════════
+    #  B站 AI Bot 补丁守卫
+    # ══════════════════════════════════════════
+    #
+    # B站 AI Bot 每升级一次就会把「和中枢互通」的补丁整段删掉（已经踩过两次：
+    # 表现是 B站 那边突然不记得 QQ 的事、看了什么也不进中枢，而且一声不响）。
+    #
+    # 除了改它的源文件（第一层，重启后就在），这里再加一层运行时补丁：
+    # 直接给已经加载的插件对象包两个方法，改内存里的类，不碰文件。
+    #
+    # 好处是插件升级覆盖文件、甚至换一版代码结构，这层都不受影响；
+    # 而且不用重启 AstrBot，下一个请求就生效。
+    #
+    # 两层互斥：文件补丁还在就跳过运行时，否则同一条记忆会镜像两遍。
+
+    def _bili_star(self):
+        try:
+            return self.context.get_registered_star("astrbot_plugin_bilibili_ai_bot")
+        except Exception:
+            return None
+
+    async def _mirror_bili_memory(self, text: str, memory_type: str, extra: dict[str, Any]) -> None:
+        """B站 侧「她自己的事」写进中枢。只写视频/动态/直播，聊天记录不从这里走。"""
+        if not self.enabled:
+            return
+        payload = extra if isinstance(extra, dict) else {}
+        await self.remember_bili(
+            str(text or ""),
+            kind=str(memory_type),
+            visibility="bot_self",
+            bvid=str(payload.get("bvid") or ""),
+            occurred_at=str(payload.get("time") or ""),
+            tags=["B站", str(memory_type)],
+            important=0.7 if memory_type == "video" else 0.6,
+            reality="bot_action",
+        )
+
+    def _patch_memory_writer(self, writer: Any) -> str:
+        cls = type(writer)
+        if hasattr(cls, "_mirror_to_life_bridge"):
+            return "writer:file"        # 文件补丁还在，别重复包
+        if getattr(cls, "_paopao_bridge_patched", False):
+            return "writer:patched"
+        original = getattr(cls, "_save_self_memory_record", None)
+        if original is None:
+            return "writer:missing"
+        try:
+            sig = inspect.signature(original)
+        except (TypeError, ValueError):
+            return "writer:no-signature"
+        bridge = self
+
+        async def _patched(self, *args, **kwargs):
+            result = await original(self, *args, **kwargs)
+            try:
+                bound = sig.bind(self, *args, **kwargs)
+                bound.apply_defaults()
+                memory_type = str(bound.arguments.get("memory_type") or "chat")
+                if memory_type not in ("video", "dynamic", "live"):
+                    return result
+                await bridge._mirror_bili_memory(
+                    str(bound.arguments.get("text") or ""),
+                    memory_type,
+                    bound.arguments.get("extra") or {},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[生活桥] 运行时镜像 B站 记忆失败（不影响 B站 侧）：{exc}")
+            return result
+
+        cls._save_self_memory_record = _patched
+        cls._paopao_bridge_patched = True
+        logger.info("[生活桥] B站 补丁不在，已运行时接上（写：看片/发动态进中枢）")
+        return "writer:patched"
+
+    def _patch_reply_context(self, reply_ctx: Any) -> str:
+        cls = type(reply_ctx)
+        if hasattr(cls, "_external_memory_block"):
+            return "reply:file"
+        if getattr(cls, "_paopao_bridge_patched", False):
+            return "reply:patched"
+        original = getattr(cls, "_build_memory_context", None)
+        if original is None:
+            return "reply:missing"
+        try:
+            sig = inspect.signature(original)
+        except (TypeError, ValueError):
+            return "reply:no-signature"
+        bridge = self
+
+        async def _patched(self, *args, **kwargs):
+            try:
+                bound = sig.bind(self, *args, **kwargs)
+                bound.apply_defaults()
+                call = bound.arguments
+            except TypeError:
+                call = {}
+            base = await original(self, *args, **kwargs)
+            try:
+                extra = await bridge.recall_for_bili(
+                    str(call.get("query_text") or ""),
+                    channel=str(call.get("channel") or "comment"),
+                    user_id=str(call.get("user_id") or ""),
+                    oid=str(call.get("oid") or ""),
+                    thread_id=str(call.get("thread_id") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[生活桥] 运行时读中枢失败（不影响 B站 侧回复）：{exc}")
+                extra = ""
+            if not extra:
+                return base
+            return (base + "\n\n" + extra) if base else extra
+
+        cls._build_memory_context = _patched
+        cls._paopao_bridge_patched = True
+        logger.info("[生活桥] B站 补丁不在，已运行时接上（读：回评论时读中枢）")
+        return "reply:patched"
+
+    async def _install_bili_bridge_patch(self) -> bool:
+        """给 B站 AI Bot 打运行时补丁。返回 True 表示插件已加载、检查过了。"""
+        star = self._bili_star()
+        if star is None:
+            return False
+        bot = getattr(star, "star_cls", None)
+        if bot is None:
+            return False
+        parts: list[str] = []
+        writer = getattr(bot, "memory_writer", None)
+        if writer is not None:
+            parts.append(self._patch_memory_writer(writer))
+        reply_ctx = getattr(bot, "reply_context", None)
+        if reply_ctx is not None:
+            parts.append(self._patch_reply_context(reply_ctx))
+        self._bili_patch_status = "+".join(parts) or "no-target"
+        if any(p.endswith(":patched") for p in parts):
+            logger.info("[LifeBridge] B站 补丁守卫：%s", self._bili_patch_status)
+        elif self.debug:
+            logger.info(f"[生活桥] B站 补丁状态：{self._bili_patch_status}")
+        return True
+
+    async def _bili_patch_loop(self) -> None:
+        """插件加载顺序不定，前几分钟反复试；之后每 10 分钟复查一次。
+
+        升级 B站 插件会让 AstrBot 重新加载它（新类、新对象），旧补丁跟着丢掉，
+        这个循环会在下一轮把补丁接回去 —— 不用重启，也不用人工介入。
+        """
+        try:
+            for _ in range(36):        # 最多等 6 分钟
+                if await self._install_bili_bridge_patch():
+                    break
+                await asyncio.sleep(10)
+            while True:
+                await asyncio.sleep(120)
+                await self._install_bili_bridge_patch()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[生活桥] B站 补丁守卫异常退出：{exc}")
+
     def health(self) -> dict[str, Any]:
         """给文档里的健康检查用。"""
         return {
@@ -1263,6 +1436,7 @@ class PaopaoLifeBridge(Star):
             "memory_service": self._memory_service() is not None,
             "companion_provider": self._registration is not None,
             "mailbox_listening": self._http_site is not None,
+            "bili_patch": self._bili_patch_status,
             "writes": self.write_count,
             "reads": self.read_count,
             "pet_writes": self.pet_write_count,
