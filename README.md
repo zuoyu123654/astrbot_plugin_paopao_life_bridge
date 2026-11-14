@@ -91,8 +91,13 @@ QQ 私聊召回时，它把**中枢里 B站 来源**的条目补进去，避免�
 | DSH 对话 | `private_pair` | 同上 |
 | DSH `--self` | `bot_self` | 所有端 |
 
-写入有节流（太短不记、同句 30 分钟内只记一次、聊天 120 秒一条、识屏 20 秒一条），
-不然中枢会被桌面的口水话淹掉。
+写入不是每句话都落库，而是**攒一批压成一条**：攒够 6 条（识屏 4 条）、或者聊天停下 90 秒、
+或者一口气聊了 8 分钟，就调一次模型把这批压成 200–350 字的记忆。
+出现「约定 / 答应 / 记住 / 喜欢 / 生日 / 怕」这类词时不等攒批，当场单独写。
+
+这样既不丢内容，也不会把中枢刷成流水账。模型不可用时自动退回「拼原文」，宁可难看也不丢。
+
+识屏的 `user` 字段里混着桌宠自己的提示词模板，会先被剥掉再记 —— 她不该「记得」自己收到的指令。
 
 自带一个命令行客户端（只用标准库）：
 
@@ -163,9 +168,19 @@ WHERE visibility = 'bot_self' GROUP BY visibility, source_plugin;
 | `enable_pet_recall` | `true` | 桌宠能读中枢 |
 | `enable_external_write` | `true` | 允许 DSH 写记忆 |
 | `pet_min_user_chars` | `4` | 太短不记 |
-| `pet_dedupe_seconds` | `1800` | 同一句多久内不重复记 |
-| `pet_min_interval_seconds` | `120` | 桌宠聊天写入间隔 |
-| `pet_vision_min_interval_seconds` | `20` | 桌宠识屏写入间隔 |
+| `pet_dedupe_seconds` | `1800` | 同一句多久内不重复收 |
+| `pet_summary_enabled` | `true` | 攒批总结；关掉退化成拼原文 |
+| `pet_chat_summary_items` | `6` | 聊天攒够几条总结 |
+| `pet_vision_summary_items` | `4` | 识屏攒够几条总结 |
+| `pet_chat_summary_idle_seconds` | `90` | 聊天停多久就总结（最常用） |
+| `pet_vision_summary_idle_seconds` | `120` | 识屏停多久就总结 |
+| `pet_chat_summary_max_minutes` | `8` | 聊天最多攒几分钟 |
+| `pet_vision_summary_max_minutes` | `15` | 识屏最多攒几分钟 |
+| `pet_buffer_max_items` | `24` | 缓冲上限，超了强制总结 |
+| `pet_summary_max_chars` | `320` | 一条总结最多多少字 |
+| `pet_summary_provider_id` | 空 | 用哪个模型总结，空=当前默认 |
+| `pet_summary_timeout` | `45` | 总结超时（秒），超了用原文兜底 |
+| `pet_important_direct` | `true` | 重要的话当场单独记 |
 | `pet_chat_importance` | `0.5` | 桌宠聊天记忆的重要度 |
 | `pet_vision_importance` | `0.55` | 桌宠识屏记忆的重要度 |
 | `pet_recall_top_k` | `5` | 桌宠 / DSH 每次读几条 |
@@ -253,5 +268,6 @@ bridge.health()   # {"enabled":..., "memory_service":..., "companion_provider":.
 - 1.0.0 — 初版。三个功能：B站 读、QQ 补、B站 写回。
 - 1.1.x — 补丁：`_plugin_data_dir` 重复定义、owner 校验、配置 BOM 兼容。
 - 1.2.0 — 加记忆信箱（本地 HTTP 9889）：桌宠和 DSH 接进来。识屏记 `bot_self`、聊天记 `private_pair`，带写入节流和去重；附命令行客户端 `tools/paopao_memory.py`。
+- 1.3.0 — 把「按时间节流」换成「攒批总结」：1.2.0 的节流会只留每 2 分钟的第一句，等于随机抽内容。现在攒够条数 / 聊停 90 秒 / 攒满 8 分钟就压成一条 200–350 字的记忆，重要的话当场单独写；顺手剥掉识屏里混进来的提示词模板。
 
 兼容：AstrBot >= 4.27，陪伴插件 >= 7.0.7，记忆中枢 >= 1.10.0。
