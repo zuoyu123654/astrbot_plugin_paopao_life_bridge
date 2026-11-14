@@ -4,11 +4,23 @@
 
 1. 桥不生产记忆。它只做两件翻译：
    - 陪伴插件的日记/梦境/主动消息  →  记忆中枢的 bot_self 记忆
-   - 记忆中枢里她自己的经历        →  B站 侧回复时要看的"我记得的其他场合"
+   - 记忆中枢里她自己的经历        →  别的端回复时要看的"我记得的其他场合"
 2. 写的时候决定可见性，读的时候只做过滤。**不要在写的时候脱敏**，否则别的端永远
    拿不回细节；也不要在读的时候放宽，否则评论区会说漏 QQ 的私事。
 3. 所有跨端调用都包在 try/except 里。桥挂了只会让她"忘事"，不能让她不回话。
 4. 幂等键用源记录的 memory_id，重放不会写两条。
+
+从 1.2.0 起多了一层「记忆信箱」（只在 127.0.0.1 上监听）：
+
+    POST /pet/inbox        桌宠网关推来一轮对话（{scenario,user,assistant,ts}）
+    POST /memory/recall    任何本地进程按私聊语义召回一段可直接拼进提示词的文字
+    POST /memory/remember  任何本地进程写一条记忆
+    GET  /health           健康检查
+
+为什么要走 HTTP 而不是让桌宠直连数据库：
+记忆中枢是 SQLite + WAL，多进程写会锁库，schema 升级时会崩。桌宠是独立的
+PyInstaller 程序，绝对不能碰那个 .db。所有写入必须回到 AstrBot 进程里，
+经由 service 接口完成 —— 这就是这层信箱存在的唯一理由。
 
 配对的两个插件：
   - astrbot_plugin_private_companion（我会永远陪着你）→ 生活、日程、心情、日记
@@ -16,6 +28,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -23,8 +37,13 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 
+try:  # aiohttp 是 AstrBot 的依赖，正常情况下一定在
+    from aiohttp import web
+except Exception:  # pragma: no cover
+    web = None
+
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.2.0"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -40,17 +59,29 @@ LIFE_KIND_TO_TYPE = {
     "proactive_message": "proactive",
 }
 
+#: 桌宠网关推来的 scenario 决定这条记忆算谁的。
+PET_SCENARIO_KIND = {
+    "vision": "pet_vision",   # 她亲眼看到的屏幕 → bot_self，所有端可读
+    "chat": "pet_chat",       # 桌面上聊的天      → private_pair，只对老大本人
+}
+
 MAX_CONTENT = 1200
+_SPACES = re.compile(r"\s+")
 
 
 def _clean(value: Any, limit: int = 200) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _squash(value: Any, limit: int = 200) -> str:
+    """把换行和连续空格压成单个空格，记忆里不该出现大段换行。"""
+    return _SPACES.sub(" ", str(value or "")).strip()[:limit]
+
+
 @register(
     PLUGIN_NAME,
     "paopao",
-    "生活桥：把陪伴插件的生活和记忆中枢接成一份，让 QQ / B站 / DSH 是同一个她。",
+    "生活桥：把陪伴插件的生活和记忆中枢接成一份，让 QQ / B站 / 桌宠 / DSH 是同一个她。",
     PLUGIN_VERSION,
     "https://local.invalid/paopao_life_bridge",
 )
@@ -65,6 +96,15 @@ class PaopaoLifeBridge(Star):
         self.write_count: int = 0
         self.read_count: int = 0
         self.last_error: str = ""
+
+        # 记忆信箱
+        self._http_runner: Any = None
+        self._http_site: Any = None
+        self.pet_write_count: int = 0
+        self.dsh_write_count: int = 0
+        self.pet_skip_count: int = 0
+        self._pet_seen: dict[str, float] = {}
+        self._pet_last_write: dict[str, float] = {"chat": 0.0, "vision": 0.0}
 
     # ══════════════════════════════════════════
     #  配置
@@ -83,9 +123,19 @@ class PaopaoLifeBridge(Star):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on", "启用"}
 
-    def _int(self, key: str, default: int, minimum: int = 0, maximum: int = 50) -> int:
+    def _int(self, key: str, default: int, minimum: int = 0, maximum: int | None = 50) -> int:
         try:
             value = int(self._cfg(key, default))
+        except (TypeError, ValueError):
+            return default
+        value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _float(self, key: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+        try:
+            value = float(self._cfg(key, default))
         except (TypeError, ValueError):
             return default
         return max(minimum, min(maximum, value))
@@ -161,14 +211,16 @@ class PaopaoLifeBridge(Star):
             logger.info("[生活桥] 未启用，跳过注册")
             return
         ok = await self._register_provider()
+        await self._start_http()
         try:
             has_memory = self._memory_service() is not None
         except Exception:
             has_memory = False
         logger.info(
-            "[LifeBridge] self-check memory=%s companion=%s owner_qq=%s owner_bili=%s",
+            "[LifeBridge] self-check memory=%s companion=%s mailbox=%s owner_qq=%s owner_bili=%s",
             "ok" if has_memory else "missing",
             "ok" if ok else "missing",
+            "ok" if self._http_site is not None else "off",
             self.owner_qq or "?",
             self.owner_bili or "?",
         )
@@ -184,6 +236,7 @@ class PaopaoLifeBridge(Star):
             )
 
     async def terminate(self):
+        await self._stop_http()
         api = self._companion_api
         registration = self._registration
         self._registration = None
@@ -368,6 +421,41 @@ class PaopaoLifeBridge(Star):
         source = str(item.get("source_plugin") or "").lower()
         return any(source.startswith(prefix) for prefix in BILI_SOURCE_PREFIXES)
 
+    def _render_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        allow_private_pair: bool,
+        budget: int,
+        limit: int,
+        exclude_types: set[str] | None = None,
+    ) -> list[str]:
+        """把中枢的检索结果压成提示词里的几行短句。读不到就返回空列表。
+
+        过滤只在这里做：写的时候一律原样入库，读的时候才决定给不给看。
+        """
+        lines: list[str] = []
+        used = 0
+        for item in items or []:
+            visibility = str(item.get("visibility") or "")
+            if visibility == "private_pair" and not allow_private_pair:
+                continue
+            if visibility not in {"bot_self", "shareable", "private_pair", "group_public"}:
+                continue
+            if exclude_types and str(item.get("memory_type") or "") in exclude_types:
+                continue
+            content = _clean(item.get("content"), 400)
+            if not content:
+                continue
+            if used + len(content) > budget and lines:
+                break
+            used += len(content)
+            stamp = _clean(item.get("occurred_at"), 16)
+            lines.append(f"- {stamp} {content}".strip() if stamp else f"- {content}")
+            if len(lines) >= limit:
+                break
+        return lines
+
     async def recall_for_bili(
         self,
         query: str,
@@ -535,14 +623,414 @@ class PaopaoLifeBridge(Star):
         except Exception:
             return False
 
+    # ══════════════════════════════════════════
+    #  记忆信箱 · 写入（桌宠 / DSH）
+    # ══════════════════════════════════════════
+
+    def _is_noise(self, text: str) -> bool:
+        """桌宠的 system 里会混进 DSH 状态播报，那不是她经历的对话，别记。"""
+        raw = self._cfg("pet_noise_markers", []) or []
+        if not isinstance(raw, list):
+            raw = [raw]
+        haystack = text or ""
+        return any(str(marker) and str(marker) in haystack for marker in raw)
+
+    def _pet_should_skip(self, scenario: str, user_text: str) -> str:
+        """返回跳过原因，空串表示可以写。"""
+        if len(user_text) < self._int("pet_min_user_chars", 4, 1, 200):
+            return "too_short"
+        if self._is_noise(user_text):
+            return "noise"
+        now = time.time()
+        # 同一句话在这个窗口里写过就不写第二次（桌宠重发、点两下都会触发）
+        seen_ttl = self._int("pet_dedupe_seconds", 1800, 0, 86400)
+        key = hashlib.sha1(f"{scenario}|{user_text[:120]}".encode("utf-8")).hexdigest()
+        last = self._pet_seen.get(key, 0.0)
+        if seen_ttl and now - last < seen_ttl:
+            return "duplicate"
+        # 场景级节流：连着聊天不至于把中枢刷满
+        gap = self._int(
+            "pet_min_interval_seconds" if scenario == "chat" else "pet_vision_min_interval_seconds",
+            120 if scenario == "chat" else 20,
+            0,
+            86400,
+        )
+        if gap and now - self._pet_last_write.get(scenario, 0.0) < gap:
+            return "throttled"
+        # 记下来，真正写成功也还会再更新一次时间
+        if seen_ttl:
+            self._pet_seen[key] = now
+        return ""
+
+    async def ingest_pet(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """收下桌宠网关推来的一轮对话。
+
+        可见性按场景分两种，这是隐私边界所在，别为了"方便"改：
+          - vision（识屏）→ bot_self：她亲眼看到的桌面，别的端也能提
+          - chat  （聊天）→ private_pair：只对老大本人，B站 评论区读不到
+        """
+        if not self.enabled or not self._bool("enable_pet_ingest", True):
+            return {"ok": False, "state": "disabled"}
+        service = self._memory_service()
+        if service is None:
+            return {"ok": False, "state": "memory_missing"}
+        scenario = _clean(payload.get("scenario"), 20).lower() or "chat"
+        if scenario not in PET_SCENARIO_KIND:
+            scenario = "chat"
+        user_text = _squash(payload.get("user"), 1200)
+        reply = _squash(payload.get("assistant"), 2000)
+        if not reply:
+            return {"ok": False, "state": "no_reply"}
+        reason = self._pet_should_skip(scenario, user_text)
+        if reason:
+            self.pet_skip_count += 1
+            if self.debug:
+                logger.info(f"[生活桥] 桌宠 {scenario} 跳过（{reason}）：{user_text[:30]}")
+            return {"ok": False, "state": reason}
+
+        try:
+            epoch = int(payload.get("ts") or time.time())
+        except (TypeError, ValueError):
+            epoch = int(time.time())
+        occurred_at = datetime.fromtimestamp(epoch).isoformat()
+        memory_type = PET_SCENARIO_KIND[scenario]
+
+        if scenario == "vision":
+            body = f"【电脑桌面·识屏】{user_text}｜我：{reply}"
+        else:
+            body = f"【电脑桌面·聊天】老大：{user_text}｜我：{reply}"
+        body = _clean(body, MAX_CONTENT)
+
+        try:
+            if scenario == "vision":
+                # 她自己的眼睛看到的，挂在 bot_self 上，所有端都能提起来。
+                memory_id = f"pet:vision:{epoch}"
+                await service.record_external_event(
+                    content=body,
+                    memory_type=memory_type,
+                    visibility="bot_self",
+                    scope="private",
+                    platform="desktop_pet",
+                    session_id="pet:desktop",
+                    reality_level="bot_action",
+                    lifecycle="stable_memory",
+                    confidence=0.86,
+                    importance=self._float("pet_vision_importance", 0.55, 0.1, 1.0),
+                    review_status="auto",
+                    tags=["桌面", "识屏"],
+                    metadata={"life_bridge": PROVIDER_ID, "pet_scenario": scenario},
+                    source_plugin="paopao_pet",
+                    occurred_at=occurred_at,
+                    memory_id=memory_id,
+                )
+            else:
+                # 桌面上聊的天属于私聊，绑到老大身上：QQ 私聊和 B站 私信能读到，
+                # 群里和评论区读不到。走中枢那个更窄的 external_memory 接口。
+                result = await service.record_external_memory(
+                    user_id=self.owner_qq,
+                    content=body,
+                    memory_type=memory_type,
+                    source_plugin="paopao_pet",
+                    occurred_at=occurred_at,
+                    idempotency_key=f"pet:{epoch}",
+                    memory_id=f"pet:chat:{epoch}",
+                    importance=self._float("pet_chat_importance", 0.5, 0.1, 1.0),
+                    confidence=0.82,
+                    tags=["桌面", "聊天"],
+                    metadata={"life_bridge": PROVIDER_ID, "pet_scenario": scenario},
+                )
+                memory_id = str((result or {}).get("memory_id") or "")
+                if not (result or {}).get("ok"):
+                    raise RuntimeError(str((result or {}).get("error_code") or "record_failed"))
+
+            self._pet_last_write[scenario] = time.time()
+            self.pet_write_count += 1
+            self.write_count += 1
+            self.last_write_at = time.time()
+            if self.debug:
+                logger.info(f"[生活桥] 桌宠 {scenario} 已入中枢：{body[:40]}")
+            return {"ok": True, "state": "stored", "memory_id": memory_id}
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"ingest_pet: {exc}"
+            logger.warning(f"[生活桥] 写桌宠记忆失败：{exc}")
+            return {"ok": False, "state": "error", "error": str(exc)}
+
+    async def remember_external(
+        self,
+        content: str,
+        *,
+        source: str = "paopao_dsh",
+        visibility: str = "private_pair",
+        memory_type: str = "dsh_chat",
+        occurred_at: str = "",
+        tags: list[str] | None = None,
+        importance: float = 0.6,
+        memory_id: str = "",
+    ) -> dict[str, Any]:
+        """任何本地进程（DSH）写一条记忆。私聊语义，绑到老大身上。"""
+        if not self.enabled:
+            return {"ok": False, "state": "disabled"}
+        service = self._memory_service()
+        if service is None:
+            return {"ok": False, "state": "memory_missing"}
+        body = _clean(content, MAX_CONTENT)
+        if not body:
+            return {"ok": False, "state": "empty"}
+        stamp = _clean(occurred_at, 60) or datetime.now().isoformat()
+        idem = _clean(memory_id, 120) or f"{source}:{stamp}:{body[:40]}"
+        try:
+            if visibility == "bot_self":
+                mid = memory_id or f"{source}:self:{stamp}:{body[:16]}"
+                await service.record_external_event(
+                    content=body,
+                    memory_type=memory_type,
+                    visibility="bot_self",
+                    scope="private",
+                    platform=source,
+                    session_id=f"{source}:activity",
+                    reality_level="bot_action",
+                    lifecycle="stable_memory",
+                    confidence=0.86,
+                    importance=importance,
+                    review_status="auto",
+                    tags=[t for t in (tags or ["DSH"]) if t][:8],
+                    metadata={"life_bridge": PROVIDER_ID},
+                    source_plugin=source,
+                    occurred_at=stamp,
+                    memory_id=mid,
+                )
+            else:
+                result = await service.record_external_memory(
+                    user_id=self.owner_qq,
+                    content=body,
+                    memory_type=memory_type,
+                    source_plugin=source,
+                    occurred_at=stamp,
+                    idempotency_key=idem,
+                    memory_id=memory_id,
+                    importance=importance,
+                    confidence=0.82,
+                    tags=[t for t in (tags or ["DSH"]) if t][:8],
+                    metadata={"life_bridge": PROVIDER_ID},
+                )
+                if not (result or {}).get("ok"):
+                    return {"ok": False, "state": "rejected", "error": str((result or {}).get("error_code") or "")}
+                mid = str((result or {}).get("memory_id") or "")
+            self.dsh_write_count += 1
+            self.write_count += 1
+            self.last_write_at = time.time()
+            return {"ok": True, "state": "stored", "memory_id": mid}
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"remember_external: {exc}"
+            logger.warning(f"[生活桥] 写外部记忆失败：{exc}")
+            return {"ok": False, "state": "error", "error": str(exc)}
+
+    # ══════════════════════════════════════════
+    #  记忆信箱 · 读取（桌宠 / DSH）
+    # ══════════════════════════════════════════
+
+    async def recall_private(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        max_chars: int = 800,
+        session_id: str = "pet:desktop",
+        platform: str = "desktop_pet",
+        head: str = "",
+    ) -> str:
+        """按私聊语义召回一段文字（桌宠桌面 / DSH 都用它）。
+
+        scope=private + user_id=老大 → 能读到 private_pair（和老大本人的私事）、
+        bot_self（她自己的经历）、shareable（可以到处说的）、group_public（群里的公开话）。
+        读不到 group_public 之外任何别的东西，所以评论区那套边界不受影响。
+        """
+        if not self.enabled or not self._bool("enable_pet_recall", True):
+            return ""
+        service = self._memory_service()
+        if service is None:
+            return ""
+        text = _clean(query, 600) or "今天"
+        try:
+            items = await service.bridge_search(
+                text,
+                session_context={
+                    "session_id": session_id[:180],
+                    "scope": "private",
+                    "platform": platform,
+                    "user_id": self.owner_qq,
+                    "group_id": "",
+                    "message_text": "",
+                    "strict_session_only": False,
+                },
+                top_k=max(limit * 3, 8),
+            )
+            if not items:
+                return ""
+            exclude = set()
+            raw_exclude = self._cfg("pet_exclude_memory_types", []) or []
+            if isinstance(raw_exclude, list):
+                exclude = {str(x) for x in raw_exclude if x}
+            lines = self._render_items(
+                items,
+                allow_private_pair=bool(self.owner_qq),
+                budget=max_chars,
+                limit=limit,
+                exclude_types=exclude,
+            )
+            if not lines:
+                return ""
+            self.read_count += 1
+            self.last_read_at = time.time()
+            if self.debug:
+                logger.info(f"[生活桥] {platform} 注入 {len(lines)} 条")
+            block = head or (
+                "【你记得的其他场合（同一份记忆，不是这次对话）】\n"
+                "这些是你真实经历过的：QQ 里聊过的、B站 上做过的、桌面上看到过的。\n"
+                "可以像回忆一样自然提起来，别念清单，也别说「记忆里写着」。\n"
+            )
+            return block + "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"recall_private: {exc}"
+            logger.warning(f"[生活桥] {platform} 读记忆失败：{exc}")
+            return ""
+
+    # ══════════════════════════════════════════
+    #  记忆信箱 · HTTP（只监听 127.0.0.1）
+    # ══════════════════════════════════════════
+
+    def _auth_ok(self, request) -> bool:
+        token = _clean(self._cfg("http_token", ""), 200)
+        if not token:
+            return True
+        return request.headers.get("X-Paopao-Token", "") == token
+
+    async def _start_http(self) -> None:
+        if not self._bool("enable_http", True):
+            logger.info("[生活桥] 记忆信箱未启用（enable_http=false），桌宠和 DSH 不会同步记忆")
+            return
+        if web is None:
+            logger.warning("[生活桥] 没有 aiohttp，记忆信箱起不来，桌宠记忆不会同步")
+            return
+        host = _clean(self._cfg("http_host", "127.0.0.1"), 60) or "127.0.0.1"
+        port = self._int("http_port", 9889, minimum=1, maximum=65535)
+        app = web.Application(client_max_size=1 << 20)
+        app.router.add_get("/health", self._http_health)
+        app.router.add_post("/pet/inbox", self._http_pet_inbox)
+        app.router.add_post("/memory/recall", self._http_recall)
+        app.router.add_post("/memory/remember", self._http_remember)
+        runner = web.AppRunner(app, access_log=None)
+        try:
+            await runner.setup()
+            site = web.TCPSite(runner, host, port)
+            await site.start()
+        except OSError as exc:
+            logger.warning(f"[生活桥] 记忆信箱端口 {host}:{port} 起不来（{exc}），桌宠记忆不会同步")
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[生活桥] 记忆信箱启动失败：{exc}")
+            return
+        self._http_runner = runner
+        self._http_site = site
+        logger.info("[LifeBridge] 记忆信箱已监听 http://%s:%d", host, port)
+
+    async def _stop_http(self) -> None:
+        runner = self._http_runner
+        self._http_runner = None
+        self._http_site = None
+        if runner is None:
+            return
+        try:
+            await runner.cleanup()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[生活桥] 记忆信箱关闭失败：{exc}")
+
+    async def _read_json(self, request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def _http_health(self, request):  # noqa: ANN001
+        if not self._auth_ok(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return web.json_response(self.health())
+
+    async def _http_pet_inbox(self, request):  # noqa: ANN001
+        if not self._auth_ok(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        payload = await self._read_json(request)
+        if not payload:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        return web.json_response(await self.ingest_pet(payload))
+
+    async def _http_recall(self, request):  # noqa: ANN001
+        if not self._auth_ok(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        payload = await self._read_json(request)
+        query = _clean(payload.get("query"), 600)
+        if not query:
+            return web.json_response({"ok": False, "error": "query required"}, status=400)
+        source = _clean(payload.get("source"), 40) or "desktop_pet"
+        try:
+            asked = int(payload.get("limit") or 0)
+        except (TypeError, ValueError):
+            asked = 0
+        limit = asked if asked > 0 else self._int("pet_recall_top_k", 5, 1, 12)
+        text = await self.recall_private(
+            query,
+            limit=min(limit, 12),
+            max_chars=self._int("pet_recall_max_chars", 800, 100, 4000),
+            session_id=f"{source}:desktop"[:180],
+            platform=source,
+        )
+        return web.json_response({"ok": bool(text), "text": text, "chars": len(text)})
+
+    async def _http_remember(self, request):  # noqa: ANN001
+        if not self._auth_ok(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        if not self._bool("enable_external_write", True):
+            return web.json_response({"ok": False, "state": "disabled"}, status=403)
+        payload = await self._read_json(request)
+        content = _clean(payload.get("content"), MAX_CONTENT)
+        if not content:
+            return web.json_response({"ok": False, "error": "content required"}, status=400)
+        tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
+        try:
+            importance = float(payload.get("importance", 0.6))
+        except (TypeError, ValueError):
+            importance = 0.6
+        result = await self.remember_external(
+            content,
+            source=_clean(payload.get("source"), 40) or "paopao_dsh",
+            visibility=_clean(payload.get("visibility"), 20) or "private_pair",
+            memory_type=_clean(payload.get("memory_type"), 40) or "dsh_chat",
+            occurred_at=_clean(payload.get("occurred_at"), 60),
+            tags=[_clean(t, 30) for t in tags if _clean(t, 30)][:8],
+            importance=max(0.1, min(1.0, importance)),
+            memory_id=_clean(payload.get("memory_id"), 120),
+        )
+        return web.json_response(result)
+
     def health(self) -> dict[str, Any]:
         """给文档里的健康检查用。"""
         return {
+            "ok": self._memory_service() is not None,
+            "version": PLUGIN_VERSION,
             "enabled": self.enabled,
             "memory_service": self._memory_service() is not None,
             "companion_provider": self._registration is not None,
+            "mailbox_listening": self._http_site is not None,
             "writes": self.write_count,
             "reads": self.read_count,
+            "pet_writes": self.pet_write_count,
+            "pet_skips": self.pet_skip_count,
+            "external_writes": self.dsh_write_count,
             "last_write_at": self.last_write_at,
             "last_read_at": self.last_read_at,
             "last_error": self.last_error,
