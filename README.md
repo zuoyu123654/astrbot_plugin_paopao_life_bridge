@@ -111,6 +111,20 @@ $cli = "<AstrBot>\data\plugins\paopao_life_bridge\tools\paopao_memory.py"
 & $py $cli health
 ```
 
+### 5. B站 补丁守卫（1.4.0 新增）
+
+B站 AI Bot 每升级一次都会把「和中枢互通」的补丁整段删掉（踩过两次，每次都是静默断掉）。
+生活桥启动后直接在**内存**里给它的两个对象包方法：
+
+| 包哪个 | 干什么 |
+|---|---|
+| `MemoryWriter._save_self_memory_record` | 看片/发动态后镜像一条进中枢 |
+| `ReplyContext._build_memory_context` | 回评论/私信前把中枢里的「别的场合」拼进去 |
+
+不改文件、不用重启；插件被重新加载后最迟 2 分钟自动接回。
+状态看 `/health` 的 `bili_patch`：`writer:patched+reply:patched` 表示守卫在干活，
+`writer:file` 表示源文件里本来就有补丁（这时守卫不重复包）。
+
 ---
 
 ## 为什么 `enable_journal_ingest` 默认关闭
@@ -268,6 +282,7 @@ bridge.health()   # {"enabled":..., "memory_service":..., "companion_provider":.
 - 1.0.0 — 初版。三个功能：B站 读、QQ 补、B站 写回。
 - 1.1.x — 补丁：`_plugin_data_dir` 重复定义、owner 校验、配置 BOM 兼容。
 - 1.2.0 — 加记忆信箱（本地 HTTP 9889）：桌宠和 DSH 接进来。识屏记 `bot_self`、聊天记 `private_pair`，带写入节流和去重；附命令行客户端 `tools/paopao_memory.py`。
+- 1.4.0 — B站 补丁守卫：插件升级冲掉补丁后，生活桥在内存里自动接回（不用改文件、不用重启），health 里能看到状态。
 - 1.3.0 — 把「按时间节流」换成「攒批总结」：1.2.0 的节流会只留每 2 分钟的第一句，等于随机抽内容。现在攒够条数 / 聊停 90 秒 / 攒满 8 分钟就压成一条 200–350 字的记忆，重要的话当场单独写；顺手剥掉识屏里混进来的提示词模板。
 
 兼容：AstrBot >= 4.27，陪伴插件 >= 7.0.7，记忆中枢 >= 1.10.0。
