@@ -107,17 +107,77 @@
     "default": 1800,
     "hint": "桌宠重发、连点两下都会推两次同样的内容。0 表示不去重。"
   },
-  "pet_min_interval_seconds": {
-    "description": "桌宠聊天的写入间隔（秒）",
+  "pet_summary_enabled": {
+    "description": "桌宠记忆用「攒批总结」写入",
+    "type": "bool",
+    "default": true,
+    "hint": "打开后一批对话压成一条记忆；关掉就退化成逐条拼接（不调模型，但字数多、质量差）。"
+  },
+  "pet_chat_summary_items": {
+    "description": "聊天攒够几条就总结",
+    "type": "int",
+    "default": 6,
+    "hint": "攒够这个数立刻调一次模型压缩。太小会费 token，太大会拖慢「别的端什么时候能知道」。"
+  },
+  "pet_vision_summary_items": {
+    "description": "识屏攒够几条就总结",
+    "type": "int",
+    "default": 4,
+    "hint": "识屏一条信息量比聊天大，所以条数少一些。"
+  },
+  "pet_chat_summary_idle_seconds": {
+    "description": "聊天停多久就总结（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "这是最常用的触发：老大不说话了，90 秒后这批就落库。想让 QQ 那边更快看到就调小。"
+  },
+  "pet_vision_summary_idle_seconds": {
+    "description": "识屏停多久就总结（秒）",
     "type": "int",
     "default": 120,
-    "hint": "连着说十句只会留最早那一句，避免刷屏。识屏另有自己的间隔。"
+    "hint": "连着框选好几块屏幕时，等停下来再压成一条。"
   },
-  "pet_vision_min_interval_seconds": {
-    "description": "桌宠识屏的写入间隔（秒）",
+  "pet_chat_summary_max_minutes": {
+    "description": "聊天最多攒几分钟（分钟）",
     "type": "int",
-    "default": 20,
-    "hint": "识屏是有价值的离散事件，间隔可以比聊天短；但连着截图也会被这个挡住。"
+    "default": 8,
+    "hint": "一直聊个不停时的兜底：到点就总结，不然这批永远不落库。"
+  },
+  "pet_vision_summary_max_minutes": {
+    "description": "识屏最多攒几分钟（分钟）",
+    "type": "int",
+    "default": 15,
+    "hint": "同上，识屏放宽一些。"
+  },
+  "pet_buffer_max_items": {
+    "description": "缓冲最多压多少条（防爆）",
+    "type": "int",
+    "default": 24,
+    "hint": "超过就强制总结一次，避免模型上下文被撑爆。"
+  },
+  "pet_summary_max_chars": {
+    "description": "一条总结最多多少字",
+    "type": "int",
+    "default": 320,
+    "hint": "控制在 200–400。太长会挤占检索时的上下文预算。"
+  },
+  "pet_summary_provider_id": {
+    "description": "用哪个模型做总结（留空=当前默认）",
+    "type": "string",
+    "default": "",
+    "hint": "留空就用 AstrBot 当前的对话模型。想省钱可以单独指一个便宜的。"
+  },
+  "pet_summary_timeout": {
+    "description": "总结超时（秒）",
+    "type": "int",
+    "default": 45,
+    "hint": "超时就用原文兜底写入，不会丢。"
+  },
+  "pet_important_direct": {
+    "description": "重要的话当场单独记一条",
+    "type": "bool",
+    "default": true,
+    "hint": "出现「约定、答应、记住、喜欢、生日、怕」这类词时，不等攒批，立刻写。"
   },
   "pet_chat_importance": {
     "description": "桌宠聊天记忆的重要度",
