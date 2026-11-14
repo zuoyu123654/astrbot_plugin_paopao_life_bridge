@@ -8,14 +8,16 @@
 
 ## 0. 目标
 
-装好这个插件之后，下面四件事要成立：
+装好这个插件之后，下面五件事要成立：
 
 1. B站 回复评论时，能想起「我自己的经历」和「可以公开说的」
 2. B站 回老大私信时，能接上 QQ 里聊过的事
 3. QQ 私聊时，能补上 B站 侧发生的事
-4. 上面三条都**不串台**：评论区读不到 QQ 私聊
+4. 桌宠和 DSH 说的话进得来，也能读得出去（靠 1.2.0 的记忆信箱）
+5. 上面四条都**不串台**：评论区读不到 QQ 私聊，群里读不到私聊
 
 如果只有第 1 条成立，通常是没配 `owner_bili`。
+如果第 4 条不成立，看第 11 节。
 
 ---
 
@@ -93,9 +95,29 @@ paopao_life_bridge/
   "bili_recall_top_k": 5,
   "bili_recall_max_chars": 700,
   "qq_recall_top_k": 3,
+  "enable_http": true,
+  "http_host": "127.0.0.1",
+  "http_port": 9889,
+  "http_token": "",
+  "enable_pet_ingest": true,
+  "enable_pet_recall": true,
+  "enable_external_write": true,
+  "pet_min_user_chars": 4,
+  "pet_dedupe_seconds": 1800,
+  "pet_min_interval_seconds": 120,
+  "pet_vision_min_interval_seconds": 20,
+  "pet_chat_importance": 0.5,
+  "pet_vision_importance": 0.55,
+  "pet_recall_top_k": 5,
+  "pet_recall_max_chars": 800,
+  "pet_noise_markers": [],
+  "pet_exclude_memory_types": [],
   "debug": false
 }
 ```
+
+带 `pet_` / `http_` / `enable_http` 的那一批是 1.2.0 才有的（记忆信箱），不填也行，会用默认值。
+只有 `owner_qq` 和 `owner_bili` 是必填，其它全有默认。
 
 ### 3.1 身份归一：`owner_qq` 和 `owner_bili`
 
@@ -212,6 +234,10 @@ WHERE visibility = 'bot_self' GROUP BY visibility, source_plugin;
 | B站 私信认不出老大 | `owner_bili` ≠ `OWNER_MID` |
 | 评论区说出 QQ 的事 | 记忆的 `visibility` 错了，不是桥的问题 |
 | 一次刷片两条记忆 | `enable_journal_ingest` 被打开了，或者 `bili_bridge` 的 `sync_enabled` 还开着 |
+| `/health` 连不上（ConnectionRefused） | AstrBot 没起，或 `enable_http=false`，或端口被别的程序占了 |
+| 日志没有 `记忆信箱已监听` | 端口冲突 / aiohttp 缺失。看上一行的 WARN |
+| `mailbox_listening: true` 但 `pet_writes` 一直是 0 | 网关的 `memory_inbox_url` 没填 / 网关没重启 |
+| 桌宠记得 QQ 的事但 QQ 不记得桌宠的 | `enable_pet_ingest` 关了，或者被节流挡了（看 `pet_skips`） |
 
 想细看每次读写，把 `debug` 设成 `true`，日志里会有 `[生活桥] B站 comment 注入 N 条`。
 
@@ -234,6 +260,12 @@ WHERE visibility = 'bot_self' GROUP BY visibility, source_plugin;
 5. **不要**让别的进程直连 `memory_companion.db`。
    SQLite + WAL，多进程写会锁，schema 升级会崩。要走插件接口。
 
+6. **不要**把 `http_host` 改成 `0.0.0.0` 或本机内网 IP。
+   那等于把她所有的私聊记忆开给局域网。默认的 `127.0.0.1` 已经够桌宠和 DSH 用了。
+
+7. **不要**在桌宠的 `chat` 记录上用 `bot_self`。
+   桌面上聊的天是私聊，写成 `bot_self` 就等于让 B站 评论区能说出来。
+
 ---
 
 ## 9. 它和另外两个插件的关系（一句话版）
@@ -248,11 +280,132 @@ WHERE visibility = 'bot_self' GROUP BY visibility, source_plugin;
 
 ```
 08:00  陪伴插件生成日程                → 生活
+09:30  DSH 里聊到「上次那个蓝屏」        → 读中枢 private_pair + bot_self
+10:00  老大在桌面上框选屏幕给她看       → 记忆 bot_self（识屏）
+10:05  在桌宠里接着聊两句               → 记忆 private_pair（聊天）
 14:00  刷了三个视频，写进中枢           → 记忆 bot_self
 15:00  回了一条评论，写进中枢           → 记忆 bot_self
 20:00  QQ 私聊，读全量                 → 记忆 + 生活
+21:00  QQ 里问「你桌面上看见啥了」      → 读得到那条 bot_self 识屏
 22:00  陪伴插件写日记 → 旧桥转中枢       → 记忆 bot_self
 23:00  发 B站 动态，只读 bot_self       → 只读她自己的
+23:30  B站 评论有人问「你老大最近咋样」  → 不接，岔开（边界还在）
 ```
 
 对得上账，就是「同一个人」。
+
+---
+
+## 11. 记忆信箱：让桌宠和 DSH 也接进来（1.2.0）
+
+### 11.1 为什么是 HTTP，不是直接读数据库
+
+记忆中枢是 SQLite + WAL 的单进程库。桌宠是独立的 PyInstaller 程序，DSH 是另一个进程 ——
+让它们直接连 `memory_companion.db` 会锁库，schema 升级时还会崩。
+
+所以插件在自己的进程里开一个只监听 `127.0.0.1` 的小 HTTP 服务（默认 `9889`），
+外面只能通过它读和写，写入最终仍然回到 `service` 接口上。
+
+```
+桌宠网关 ──┐
+           ├── HTTP 127.0.0.1:9889 ──> 生活桥 ──> memory_companion service ──> db
+DSH 命令行 ┘
+```
+
+### 11.2 四个端点
+
+| 方法 | 路径 | 谁用 | 干什么 |
+|---|---|---|---|
+| POST | `/pet/inbox` | 桌宠网关 | 推一轮对话 `{scenario,user,assistant,ts}` |
+| POST | `/memory/recall` | 桌宠 / DSH | `{query,source,limit}` → 返回 `{text}` 可直接拼提示词 |
+| POST | `/memory/remember` | DSH | 写一条 `{content,visibility,tags,importance}` |
+| GET | `/health` | 排障 | 计数和状态 |
+
+`http_token` 留空就不校验；填了以后所有请求都要带 `X-Paopao-Token` 头。
+
+### 11.3 写进去算谁的（这是隐私边界，别改）
+
+| 来源 | scenario | visibility | 谁能读到 |
+|---|---|---|---|
+| 桌宠识屏 | `vision` | `bot_self` | 所有端。她亲眼看到的东西，算她自己的经历 |
+| 桌宠聊天 | `chat` | `private_pair` | 只有老大本人：QQ 私聊、B站 私信、桌宠、DSH |
+| DSH 对话 | — | `private_pair` | 同上 |
+| DSH 的 `--self` | — | `bot_self` | 所有端 |
+
+所以「桌面上她看见老大抽卡出金」QQ 和 B站 都能提；
+「桌面上老大跟她抱怨工作」只有老大自己的私聊能提，群里和评论区一个字都出不去。
+
+**这是靠 visibility 字段挡的，不是靠提示词。** 别为了让某条记忆"更好用"改成 `shareable`。
+
+### 11.4 写入节流（不然中枢会被口水话淹掉）
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `pet_min_user_chars` | 4 | 「嗯」「哦」这种不记 |
+| `pet_dedupe_seconds` | 1800 | 同一句话半小时内只记一次（桌宠会重发） |
+| `pet_min_interval_seconds` | 120 | 聊天连说十句只留第一条 |
+| `pet_vision_min_interval_seconds` | 20 | 识屏间隔短一些，但连拍也会被挡 |
+
+被挡掉的会返回 `{"ok": false, "state": "throttled"/"duplicate"/"too_short"}`，
+`/health` 里的 `pet_skips` 会加一。**这是正常的，不是坏了。**
+
+### 11.5 桌宠那边怎么接
+
+改网关的 `D:\app1\paopao_pet_gateway\config.json`：
+
+```json
+{
+  "memory_inbox_url": "http://127.0.0.1:9889/pet/inbox",
+  "memory_recall_url": "http://127.0.0.1:9889/memory/recall",
+  "memory_token": "",
+  "memory_timeout": 4,
+  "inject_memory": true
+}
+```
+
+改完重启网关（杀进程，watchdog 会在 5 分钟内拉起，或者手动跑 `ensure_running.ps1`）。
+
+行为：
+- 每轮回复完 → 后台线程推 `/pet/inbox`，不阻塞回话
+- 每轮聊天前 → 先查 `/memory/recall`，把结果作为 system 消息插到消息列表最前面，
+  日志出现 `注入跨端记忆 N 字`
+- 识屏（vision）**不查**记忆，只注入识屏账本，省一次查询
+
+### 11.6 DSH 那边怎么用
+
+插件自带一个只用标准库的小客户端：
+
+```
+<AstrBot>/data/plugins/paopao_life_bridge/tools/paopao_memory.py
+```
+
+```powershell
+$py = "<AstrBot>\venv\Scripts\python.exe"
+$cli = "<AstrBot>\data\plugins\paopao_life_bridge\tools\paopao_memory.py"
+
+& $py $cli health
+& $py $cli recall "老大最近在忙什么" --limit 5
+& $py $cli remember "老大说周末想去看海" --tags 约定,周末 --importance 0.7
+& $py $cli remember "我今天把桌宠接进了中枢" --self
+```
+
+DSH 侧没有自动注入（那是另一套插件体系），靠她自己按需调：
+涉及"以前 / 上次 / 你记得吗"时先 `recall`；老大说了值得长期记住的话就 `remember`。
+这条约定写在 DSH 的 `AGENT.md` 里。
+
+### 11.7 验证（三条）
+
+| # | 怎么做 | 期望 |
+|---|---|---|
+| 1 | `Invoke-RestMethod http://127.0.0.1:9889/health` | `mailbox_listening: true`、`memory_service: true` |
+| 2 | 在桌宠里说一句长一点的闲话 | 网关日志出现 `注入跨端记忆 N 字`；`/health` 的 `pet_writes` +1 |
+| 3 | 在 QQ 私聊问「你刚才在桌面上跟老大聊什么了」 | 说得出桌宠那边的事 |
+
+第 3 条是四端互通的验收点。说不出来先看 `pet_writes` 有没有涨 ——
+没涨是被节流挡了，等 2 分钟再说一句。
+
+### 11.8 关掉的办法
+
+- 只想断桌宠：网关 `config.json` 里把两个 url 删成 `""`
+- 不想让她在桌面上读记忆：`enable_pet_recall: false`（只写不读）
+- 整个信箱都不要：`enable_http: false`，QQ 和 B站 完全不受影响
