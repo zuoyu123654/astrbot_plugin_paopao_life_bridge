@@ -1,14 +1,17 @@
 name: paopao_life_bridge
 display_name: 泡泡生活桥
-short_desc: 把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份，让 QQ / B站 / DSH 是同一个她。
+short_desc: 把「陪着你」的生活和「记住你」的记忆接成一份，让 QQ / B站 / 桌宠 / DSH 是同一个她。
 desc: >
   生活桥不生产记忆，只做翻译：
   1. 向「我会永远陪着你」注册官方外部记忆 Provider，收下它的日记、梦境和主动消息，
      以 bot_self 可见性写进「我会牢牢记住你」，于是她的生活成了别的端也能读到的经历；
   2. 给 B站 AI Bot 提供只读接口，按场合（评论区 / 私信）读到中枢里属于她的那部分；
-  3. 给 QQ 私聊补充 B站 侧发生的事，避免只记得 QQ。
+  3. 给 QQ 私聊补充 B站 侧发生的事，避免只记得 QQ；
+  4. 在 127.0.0.1 上开一个记忆信箱（默认 9889）：桌面宠物每轮对话推进来，
+     识屏记成 bot_self、聊天记成 private_pair；查的时候按私聊语义召回，
+     于是桌面上、QQ 里、B站 上做的事是同一份记忆。DSH 走同一组接口。
   所有写入都带幂等键，重复触发不会写两条。任何失败都只记日志，不影响主回复。
-version: 1.1.1
+version: 1.2.0
 author: paopao
 repo: https://github.com/zuoyu123654/astrbot_plugin_paopao_life_bridge
 astrbot_version: ">=4.27"
