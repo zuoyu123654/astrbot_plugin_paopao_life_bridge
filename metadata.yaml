@@ -13,7 +13,10 @@ desc: >
      出现「约定 / 答应 / 记住」这类重要词时不等攒批，当场单独写。
      DSH 走同一组接口。
   所有写入都带幂等键，重复触发不会写两条。任何失败都只记日志，不影响主回复。
-version: 1.3.0
+  5. B站 补丁守卫：B站 AI Bot 每次升级都会把「和中枢互通」的补丁冲掉（已经踩两次），
+     生活桥启动后直接在内存里给它包两个方法（写：看片/发动态进中枢；读：回评论时读中枢），
+     不改文件、不用重启，最多 2 分钟自动恢复。状态看 /health 的 bili_patch。
+version: 1.4.0
 author: paopao
 repo: https://github.com/zuoyu123654/astrbot_plugin_paopao_life_bridge
 astrbot_version: ">=4.27"
