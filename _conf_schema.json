@@ -3,13 +3,13 @@
     "description": "启用生活桥",
     "type": "bool",
     "default": true,
-    "hint": "关掉后所有跨端读写都会静默跳过，QQ 和 B站 回到互不相认的状态。"
+    "hint": "关掉后所有跨端读写都会静默跳过，QQ / B站 / 桌宠 / DSH 回到互不相认的状态。"
   },
   "owner_qq": {
     "description": "主人的 QQ 号（必填）",
     "type": "string",
     "default": "",
-    "hint": "身份归一的锚点，必填。留空时 B站 私信里认不出主人，private_pair 一条都读不到。"
+    "hint": "身份归一的锚点，必填。留空时 B站 私信认不出主人、桌宠的私聊记忆也归不到人，private_pair 一条都读不到。"
   },
   "owner_bili": {
     "description": "主人的 B站 UID（必填）",
@@ -52,6 +52,108 @@
     "type": "int",
     "default": 3,
     "hint": "和内置记忆一起注入，多了会挤掉 QQ 自己的上下文。"
+  },
+  "enable_http": {
+    "description": "打开记忆信箱（本地 HTTP 收件箱）",
+    "type": "bool",
+    "default": true,
+    "hint": "桌宠和 DSH 靠这个同步记忆。只监听 127.0.0.1，不对外网开放。关掉后桌宠那一端就断了。"
+  },
+  "http_host": {
+    "description": "记忆信箱监听地址",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "**不要改成 0.0.0.0**。改了等于把她的私聊记忆暴露到局域网。"
+  },
+  "http_port": {
+    "description": "记忆信箱端口",
+    "type": "int",
+    "default": 9889,
+    "hint": "桌宠网关（9888）隔壁。改这里的话，网关 config.json 的 memory_inbox_url / memory_recall_url 要跟着改。"
+  },
+  "http_token": {
+    "description": "记忆信箱访问令牌（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "留空则不校验，只靠 127.0.0.1 兜底。填了以后请求头必须带 X-Paopao-Token。"
+  },
+  "enable_pet_ingest": {
+    "description": "把桌宠的对话写进中枢",
+    "type": "bool",
+    "default": true,
+    "hint": "识屏算她自己的经历（所有端可读），聊天算私聊（只对老大本人）。"
+  },
+  "enable_pet_recall": {
+    "description": "让桌宠能读中枢记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "桌宠每次聊天前会查一次。关掉就只剩单向写入，她在桌面上想不起 QQ / B站 的事。"
+  },
+  "enable_external_write": {
+    "description": "允许本地进程（DSH）写记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "POST /memory/remember 的开关。DSH 那边说的重要的话靠它进中枢。"
+  },
+  "pet_min_user_chars": {
+    "description": "桌宠这条太短就不记（字数）",
+    "type": "int",
+    "default": 4,
+    "hint": "「嗯」「哦」「好」这种不入库，否则中枢会被口水话淹掉。"
+  },
+  "pet_dedupe_seconds": {
+    "description": "同一句话多久内不重复记（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "桌宠重发、连点两下都会推两次同样的内容。0 表示不去重。"
+  },
+  "pet_min_interval_seconds": {
+    "description": "桌宠聊天的写入间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "连着说十句只会留最早那一句，避免刷屏。识屏另有自己的间隔。"
+  },
+  "pet_vision_min_interval_seconds": {
+    "description": "桌宠识屏的写入间隔（秒）",
+    "type": "int",
+    "default": 20,
+    "hint": "识屏是有价值的离散事件，间隔可以比聊天短；但连着截图也会被这个挡住。"
+  },
+  "pet_chat_importance": {
+    "description": "桌宠聊天记忆的重要度",
+    "type": "float",
+    "default": 0.5,
+    "hint": "0.5 左右刚好：会被想起来，但不会盖过 QQ 和 B站 的事。"
+  },
+  "pet_vision_importance": {
+    "description": "桌宠识屏记忆的重要度",
+    "type": "float",
+    "default": 0.55,
+    "hint": "她亲眼看到的东西比随口聊天稍微重要一点。"
+  },
+  "pet_recall_top_k": {
+    "description": "桌宠 / DSH 每次最多读几条",
+    "type": "int",
+    "default": 5,
+    "hint": "桌宠每轮聊天都查一次，别开太大，多了会把她的话说得很杂。"
+  },
+  "pet_recall_max_chars": {
+    "description": "桌宠 / DSH 注入的字数上限",
+    "type": "int",
+    "default": 800,
+    "hint": "超出的条目整条跳过，不截断单条。"
+  },
+  "pet_noise_markers": {
+    "description": "含这些词的桌宠输入不记（列表）",
+    "type": "list",
+    "default": [],
+    "hint": "用来挡 DSH 状态播报那种系统噪音。每行一个词，默认空。"
+  },
+  "pet_exclude_memory_types": {
+    "description": "桌宠读记忆时排除的类型（列表）",
+    "type": "list",
+    "default": [],
+    "hint": "比如填 pet_chat 就只让桌面读到识屏。默认空，什么都读。"
   },
   "debug": {
     "description": "调试日志",
