@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -98,16 +98,23 @@ CHAT_SUMMARY_PROMPT = """你在帮她整理记忆。下面是刚才在电脑桌�
 VISION_SUMMARY_PROMPT = """你在帮她整理记忆。下面是刚才她在电脑桌面上亲眼看到的屏幕内容，以及她当时的反应。
 
 请压缩成一条她以后能回想起来的记忆，要求：
-1. 只写真的出现在屏幕上的东西，不许编
-2. 写清楚「看到了什么」和「我当时说了什么」
-3. 保留具体的名称、数字、颜色、屏幕上的文字
-4. 合并重复的截图
+1. **第一句必须先说清楚「老大正在做什么」**：在玩哪个游戏、在写什么代码、在看什么视频或网页、
+   在用什么软件。以后别人问「我在干嘛」要能直接照这句答上来 —— 这条最重要。
+   写成「老大正在玩《崩坏：星穹铁道》」「老大正在改 AstrBot 的插件代码」这种直白句子，
+   不要写「老大框选屏幕给我看」「前台是 XXX.exe」这种机器视角。
+2. 再写她看到了什么、她当时说了什么，保留具体的名称、数字、颜色、屏幕上的文字
+3. 合并重复的截图
+4. 只写真的出现在屏幕上的东西，不许编
 5. 不超过 {limit} 字，一段话，不要分点、不要标题、不要任何解释
 
 记录：
 {lines}
 
 只输出那段记忆。"""
+
+#: 「我在干嘛」这类问事的说法。短问句只靠两个字匹配不到「老大正在玩…」，
+#: 检索时要放宽，QQ 侧也要额外补一条桌宠识屏。
+ACTIVITY_HINTS = ("干嘛", "干什么", "做什么", "在忙", "在玩", "在看", "在干啥", "干啥")
 
 MAX_CONTENT = 1200
 _SPACES = re.compile(r"\s+")
@@ -452,16 +459,75 @@ class PaopaoLifeBridge(Star):
                 })
                 if len(picked) >= limit:
                     break
+            # 问「我在干嘛」时补一条桌面上刚看到的。memory_companion 自己的检索
+            # 对口语化短问句召回不高，光靠它她答不上来，就成「桌宠记忆没通过去」了。
+            if any(hint in query for hint in ACTIVITY_HINTS):
+                for item in await self._recent_pet_vision(limit=2, hours=6.0):
+                    content = _clean(item.get("content"), 400)
+                    if not content:
+                        continue
+                    if used + len(content) > max_chars and picked:
+                        break
+                    used += len(content)
+                    picked.append(item)
             if picked:
                 self.read_count += 1
                 self.last_read_at = time.time()
                 if self.debug:
-                    logger.info(f"[生活桥] 给 QQ 私聊补了 {len(picked)} 条 B站 记忆")
+                    logger.info(f"[生活桥] 给 QQ 私聊补了 {len(picked)} 条（B站 / 桌面）")
             return {"items": picked}
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"provider_read: {exc}"
             logger.warning(f"[生活桥] 读 B站 记忆失败：{exc}")
             return {"items": []}
+
+    async def _recent_pet_vision(self, *, limit: int = 2, hours: float = 6.0) -> list[dict[str, Any]]:
+        """最近她在桌面上看到的（识屏摘要）。给 QQ 私聊补「我在干嘛」用。"""
+        service = self._memory_service()
+        if service is None or not self.owner_qq:
+            return []
+        try:
+            items = await service.bridge_search(
+                "老大正在做什么 在玩什么 在看什么",
+                session_context={
+                    "session_id": "pet:desktop",
+                    "scope": "private",
+                    "platform": "desktop_pet",
+                    "user_id": self.owner_qq,
+                    "group_id": "",
+                    "message_text": "",
+                    "strict_session_only": False,
+                },
+                top_k=8,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[生活桥] 查桌宠识屏失败：{exc}")
+            return []
+        cutoff = datetime.now().timestamp() - hours * 3600.0
+        picked: list[dict[str, Any]] = []
+        for item in items or []:
+            if str(item.get("memory_type") or "") not in {"pet_vision_digest", "pet_vision"}:
+                continue
+            if str(item.get("visibility") or "") not in {"bot_self", "shareable", "private_pair"}:
+                continue
+            stamp = _clean(item.get("occurred_at"), 40)
+            try:
+                if datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() < cutoff:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            content = _clean(item.get("content"), 400)
+            if not content:
+                continue
+            picked.append({
+                "id": _clean(item.get("id"), 120),
+                "content": content,
+                "occurred_at": stamp,
+                "source": "desktop_pet",
+            })
+            if len(picked) >= limit:
+                break
+        return picked
 
     # ══════════════════════════════════════════
     #  对外接口（给 B站 AI Bot 用）
@@ -741,14 +807,23 @@ class PaopaoLifeBridge(Star):
         提示词模板塞进 user 字段。那不是老大说的话，不能当记忆写进去，
         否则她会「记得」一堆她自己收到的指令。
 
-        模板里唯一有价值的是「参考元数据：前台应用 XXX」，留下来。
+        模板里唯一有价值的是「参考元数据：前台应用 XXX」，把它翻译成人话：
+        「老大正在用 Visual Studio Code」—— 这样以后问「我在干嘛」才检索得到。
         """
         text = user_text or ""
         if not any(marker in text for marker in _PET_PROMPT_MARKERS):
             return text
         meta = _PET_META_HINT.search(text)
-        hint = f"（{_squash(meta.group(1), 60)}）" if meta else ""
-        return _squash(f"老大框选了一块屏幕给我看{hint}", 200)
+        if meta:
+            raw = _squash(meta.group(1), 120)
+            # 「老大当前前台应用为 Code.exe | Visual Studio Code」→ Visual Studio Code
+            raw = re.sub(r"^.*?前台应用为\s*", "", raw)
+            parts = [p.strip() for p in raw.split("|") if p.strip()]
+            app = parts[-1] if parts else raw
+            app = re.sub(r"\.exe$", "", app, flags=re.I).strip()
+            if app:
+                return _squash(f"老大正在用 {app}", 200)
+        return "老大框选了一块屏幕给我看"
 
     # ══════════════════════════════════════════
     #  记忆信箱 · 攒批总结
@@ -762,7 +837,9 @@ class PaopaoLifeBridge(Star):
 
     @staticmethod
     def _decorate(scenario: str, text: str) -> str:
-        label = "桌面上看到" if scenario == "vision" else "桌面上聊过"
+        # 标签里带「老大在做什么」，是因为人问的是「我在干嘛」——
+        # 只写「桌面上看到」检索不到，写清楚这是什么才认得出来。
+        label = "桌面上｜老大在做什么" if scenario == "vision" else "桌面上聊过"
         return _clean(f"【{label}】{text}", MAX_CONTENT)
 
     def _digest_label(self, scenario: str) -> str:
@@ -791,8 +868,13 @@ class PaopaoLifeBridge(Star):
             return ""
 
     async def _compose_digest(self, scenario: str, items: list[dict[str, Any]]) -> str:
-        """把一批对话压成一条记忆。单条就不调模型了，省一次 token。"""
-        if len(items) == 1:
+        """把一批对话压成一条记忆。
+
+        识屏即使是单条也要总结 —— 它的价值全在「老大正在做什么」那一句上，
+        直接拼原文只会留下「框选屏幕给我看」这种机器视角，以后问「我在干嘛」检索不到。
+        聊天单条不总结，省一次 token（聊天内容本身就有信息）。
+        """
+        if len(items) == 1 and scenario != "vision":
             item = items[0]
             return self._decorate(scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}")
 
@@ -806,6 +888,9 @@ class PaopaoLifeBridge(Star):
         if text:
             return self._decorate(scenario, text)
         # 模型不可用 —— 拼原文，宁可难看也不丢
+        if len(items) == 1:
+            item = items[0]
+            return self._decorate(scenario, f"{item.get('user', '')}｜我：{item.get('reply', '')}")
         return self._decorate(scenario, _clean(lines.replace("\n", " "), limit))
 
     async def _flush_pet(self, scenario: str, reason: str = "") -> None:
@@ -1103,9 +1188,13 @@ class PaopaoLifeBridge(Star):
         if service is None:
             return ""
         text = _clean(query, 600) or "今天"
+        # 「我在干嘛」这种短问句，只靠两个字匹配不到「老大正在玩…」，放宽一点再查
+        search_text = text
+        if len(text) <= 14 or any(hint in text for hint in ACTIVITY_HINTS):
+            search_text = f"{text} 老大正在做什么 在玩什么 在看什么"
         try:
             items = await service.bridge_search(
-                text,
+                search_text,
                 session_context={
                     "session_id": session_id[:180],
                     "scope": "private",
