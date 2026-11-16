@@ -1782,6 +1782,7 @@ class PaopaoLifeBridge(Star):
             "pet_buffered": {k: len(v) for k, v in self._pet_buffer.items()},
             "pet_skips": self.pet_skip_count,
             "external_writes": self.dsh_write_count,
+            "group_summary_count": self.group_summary_count,
             "last_write_at": self.last_write_at,
             "last_read_at": self.last_read_at,
             "last_error": self.last_error,
