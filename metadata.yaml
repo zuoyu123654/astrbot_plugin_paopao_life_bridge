@@ -1,4 +1,4 @@
-name: paopao_life_bridge
+﻿name: paopao_life_bridge
 display_name: 泡泡生活桥
 short_desc: 把「陪着你」的生活和「记住你」的记忆接成一份，让 QQ / B站 / 桌宠 / DSH 是同一个她。
 desc: >
@@ -16,9 +16,7 @@ desc: >
   5. B站 补丁守卫：B站 AI Bot 每次升级都会把「和中枢互通」的补丁冲掉（已经踩两次），
      生活桥启动后直接在内存里给它包两个方法（写：看片/发动态进中枢；读：回评论时读中枢），
      不改文件、不用重启，最多 2 分钟自动恢复。状态看 /health 的 bili_patch。
-  6. 群聊参考：QQ 私聊问「群里刚才聊了什么」时，读到中枢里这个群的公开摘要；
-     群里还有没被定时摘要的新消息，就当场补总结一段（最多等 18 秒，平时不烧 token）。
-version: 1.5.0
+version: 1.5.1
 author: paopao
 repo: https://github.com/zuoyu123654/astrbot_plugin_paopao_life_bridge
 astrbot_version: ">=4.27"

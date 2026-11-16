@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.4.3"
+PLUGIN_VERSION = "1.5.1"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -1665,7 +1665,15 @@ class PaopaoLifeBridge(Star):
     )
 
     def _ensure_bili_file_patch(self) -> tuple[str, bool]:
-        """检查「手动刷只读字幕」的文件补丁，掉了就写回去。返回 (状态, 是否改过文件)。"""
+        """检查「手动刷只读字幕」的文件补丁，掉了就写回去。返回 (状态, 是否改过文件)。
+
+        ``enable_bili_file_patch`` 关掉时完全不碰对方的源文件，也不重载对方插件；
+        只保留下面 ``_patch_memory_writer`` / ``_patch_reply_context`` 的运行时补丁
+        （那两处只在内存里包方法，不改文件）。关掉之后如果 B站 插件升级冲掉了
+        「只读字幕」补丁，那部分功能会失效，需要手动打回去——这是有意的取舍。
+        """
+        if not self._bool("enable_bili_file_patch", True):
+            return "file:off", False
         base = Path(__file__).resolve().parent.parent / "astrbot_plugin_bilibili_ai_bot"
         if not base.is_dir():
             return "file:missing", False
