@@ -1,4 +1,4 @@
-﻿"""泡泡生活桥 —— 把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份。
+"""泡泡生活桥 —— 把「我会永远陪着你」的生活和「我会牢牢记住你」的记忆接成一份。
 
 设计要点（改动前先读这一段）：
 
@@ -34,6 +34,7 @@ import inspect
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -45,7 +46,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.4.2"
+PLUGIN_VERSION = "1.4.3"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -116,6 +117,10 @@ VISION_SUMMARY_PROMPT = """你在帮她整理记忆。下面是刚才她在电�
 #: 检索时要放宽，QQ 侧也要额外补一条桌宠识屏。
 ACTIVITY_HINTS = ("干嘛", "干什么", "做什么", "在忙", "在玩", "在看", "在干啥", "干啥")
 
+#: 「群里刚才聊了什么」这类问法。中枢的群公开摘要按相似度排很靠后，问的时候
+#: 直接按时间取最近几条补上，不然私聊会答成「我看不见群里」。
+GROUP_HINTS = ("群", "群聊", "群里", "群友", "那个群", "群里人")
+
 MAX_CONTENT = 1200
 _SPACES = re.compile(r"\s+")
 _PET_META_HINT = re.compile(r"参考元数据[:：]\s*([^）)]+)")
@@ -171,6 +176,10 @@ class PaopaoLifeBridge(Star):
         # B站 AI Bot 补丁守卫（运行时打补丁，插件升级覆盖了也不怕）
         self._bili_patch_task: Any = None
         self._bili_patch_status: str = "未检查"
+
+        # 群聊参考：问到群时，如果群里还有没被定时摘要的新消息，当场补一次
+        self._group_summary_at: float = 0.0
+        self.group_summary_count: int = 0
 
     # ══════════════════════════════════════════
     #  配置
@@ -345,7 +354,8 @@ class PaopaoLifeBridge(Star):
                 handles_model_memory=False,
                 is_active=lambda: self.enabled,
                 priority=0,
-                timeout_seconds=5.0,
+                # 问到群时要先补一次现场总结，18 秒兜底 + 余量；平时没新消息是秒回。
+                timeout_seconds=25.0,
             )
             self._companion_api = api
             logger.info("[生活桥] 已接入陪伴插件：日记/梦境/主动消息会写进记忆中枢")
@@ -462,9 +472,24 @@ class PaopaoLifeBridge(Star):
             # 问「我在干嘛」时补一条桌面上刚看到的。memory_companion 自己的检索
             # 对口语化短问句召回不高，光靠它她答不上来，就成「桌宠记忆没通过去」了。
             if any(hint in query for hint in ACTIVITY_HINTS):
-                for item in await self._recent_pet_vision(limit=1, hours=6.0):
+                # 12 小时：半夜问「我刚刚在干嘛」也得答得出来，但太旧的宁可不说
+                for item in await self._recent_pet_vision(limit=2, hours=12.0):
                     content = _clean(item.get("content"), 400)
                     if not content:
+                        continue
+                    if used + len(content) > max_chars and picked:
+                        break
+                    used += len(content)
+                    picked.append(item)
+            # 问「群里刚才聊了什么」时补最近的群公开摘要。中枢里这些摘要是
+            # visibility=group_public，私聊本来就允许读，但按相似度检索基本排不进前几名；
+            # 群里还有没总结的新消息时，这里会先当场补一段（见 _group_reference）。
+            if any(hint in query for hint in GROUP_HINTS):
+                for item in await self._group_reference(limit=2, hours=24.0):
+                    content = _clean(item.get("content"), 500)
+                    if not content:
+                        continue
+                    if any(content == _clean(existing.get("content"), 500) for existing in picked):
                         continue
                     if used + len(content) > max_chars and picked:
                         break
@@ -481,53 +506,166 @@ class PaopaoLifeBridge(Star):
             logger.warning(f"[生活桥] 读 B站 记忆失败：{exc}")
             return {"items": []}
 
-    async def _recent_pet_vision(self, *, limit: int = 2, hours: float = 6.0) -> list[dict[str, Any]]:
-        """最近她在桌面上看到的（识屏摘要）。给 QQ 私聊补「我在干嘛」用。"""
+    async def _latest_pet_vision_items(self, *, limit: int = 2, hours: float = 12.0) -> list[dict[str, Any]]:
+        """按时间倒序直接取最近几条识屏摘要。
+
+        不用 bridge_search 的原因：它按相关度排，而识屏摘要的措辞几乎一模一样
+        （都是「老大正在…」），一堆里面永远挑中较早的那几条——问「我现在在干嘛」
+        就会答成几小时前、甚至是昨晚的事。「最近看到什么」要的是时间，不是相似度。
+        """
         service = self._memory_service()
-        if service is None or not self.owner_qq:
+        if service is None:
+            return []
+        store = getattr(service, "store", None)
+        if store is None:
             return []
         try:
-            items = await service.bridge_search(
-                "老大正在做什么 在玩什么 在看什么",
-                session_context={
-                    "session_id": "pet:desktop",
-                    "scope": "private",
-                    "platform": "desktop_pet",
-                    "user_id": self.owner_qq,
-                    "group_id": "",
-                    "message_text": "",
-                    "strict_session_only": False,
-                },
-                top_k=8,
+            records = await store.list_memories(
+                memory_type="pet_vision_digest",
+                limit=max(20, limit * 8),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[生活桥] 查桌宠识屏失败：{exc}")
+            self.last_error = f"latest_pet_vision: {exc}"
+            logger.warning(f"[生活桥] 读最近识屏失败：{exc}")
             return []
-        cutoff = datetime.now().timestamp() - hours * 3600.0
+        cutoff = time.time() - max(1.0, float(hours)) * 3600.0
         picked: list[dict[str, Any]] = []
-        for item in items or []:
-            if str(item.get("memory_type") or "") not in {"pet_vision_digest", "pet_vision"}:
+        for record in records or []:
+            if str(getattr(record, "visibility", "") or "") not in {"bot_self", "shareable", "private_pair"}:
                 continue
-            if str(item.get("visibility") or "") not in {"bot_self", "shareable", "private_pair"}:
+            content = _clean(getattr(record, "content", ""), 400)
+            if not content:
                 continue
-            stamp = _clean(item.get("occurred_at"), 40)
+            stamp = _clean(getattr(record, "occurred_at", ""), 40)
             try:
                 if datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() < cutoff:
                     continue
             except Exception:  # noqa: BLE001
                 pass
-            content = _clean(item.get("content"), 400)
-            if not content:
-                continue
             picked.append({
-                "id": _clean(item.get("id"), 120),
+                "id": _clean(getattr(record, "id", ""), 120),
                 "content": content,
                 "occurred_at": stamp,
+                "memory_type": "pet_vision_digest",
+                "visibility": str(getattr(record, "visibility", "") or ""),
                 "source": "desktop_pet",
             })
             if len(picked) >= limit:
                 break
         return picked
+
+    async def _recent_pet_vision(self, *, limit: int = 2, hours: float = 6.0) -> list[dict[str, Any]]:
+        """最近她在桌面上看到的（识屏摘要）。给 QQ 私聊补「我在干嘛」用。"""
+        return await self._latest_pet_vision_items(limit=limit, hours=hours)
+
+    async def _recent_group_public(self, *, limit: int = 2, hours: float = 24.0) -> list[dict[str, Any]]:
+        """按时间倒序取最近的群公开摘要（visibility=group_public）。
+
+        中枢里的群摘要本来就是「群里能公开说的事」，私聊允许读
+        （visibility.allow_group_public_in_private 已开）。不按相关度检索，是因为
+        这些摘要措辞高度相似，问「群里刚才聊了什么」时永远排不进前几名。
+        """
+        service = self._memory_service()
+        if service is None:
+            return []
+        store = getattr(service, "store", None)
+        if store is None:
+            return []
+        try:
+            records = await store.list_memories(
+                visibility="group_public",
+                limit=max(24, limit * 8),
+                include_pending=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"recent_group_public: {exc}"
+            logger.warning(f"[生活桥] 读最近群摘要失败：{exc}")
+            return []
+        cutoff = time.time() - max(1.0, float(hours)) * 3600.0
+        candidates: list[dict[str, Any]] = []
+        for record in records or []:
+            if str(getattr(record, "lifecycle", "") or "") == "archived":
+                continue
+            content = _clean(getattr(record, "content", ""), 500)
+            if not content:
+                continue
+            stamp = _clean(getattr(record, "occurred_at", ""), 40)
+            try:
+                if datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() < cutoff:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            candidates.append({
+                "id": _clean(getattr(record, "id", ""), 120),
+                "content": content,
+                "occurred_at": stamp,
+                "memory_type": str(getattr(record, "memory_type", "") or ""),
+                "visibility": "group_public",
+                "source": "qq_group",
+            })
+        candidates.sort(key=lambda item: item.get("occurred_at") or "", reverse=True)
+        return candidates[:limit]
+
+    async def _group_reference(self, *, limit: int = 2, hours: float = 24.0) -> list[dict[str, Any]]:
+        """问到群时给的参考：先补一次现场总结，再取最近的群公开摘要。
+
+        群聊的定时摘要门槛默认 50 条，群不活跃时要等很久才有一段；所以只要
+        群里还有没被配进摘要的新消息，这里先当场总结一次（最多等 18 秒），
+        拿不到新摘要也不会让本次回复失败——照旧返回已有的那几条。
+        """
+        items = await self._recent_group_public(limit=limit, hours=hours)
+        try:
+            await self._summarize_group_if_new()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[生活桥] 群聊补总结失败，用已有摘要：{exc}")
+            return items
+        if self._group_summary_at <= 0:
+            return items
+        fresh = await self._recent_group_public(limit=limit, hours=hours)
+        return fresh or items
+
+    async def _summarize_group_if_new(self) -> None:
+        """群里有未摘要的新消息就 force 总结一次；90 秒内不重复。"""
+        if not self._bool("enable_group_summary_on_demand", True):
+            return
+        now = time.time()
+        if now - self._group_summary_at < 90.0:
+            return
+        service = self._memory_service()
+        if service is None:
+            return
+        store = getattr(service, "store", None)
+        summarizer = getattr(service, "maybe_summarize_session", None)
+        if store is None or not callable(summarizer):
+            return
+        rows = await store.recent_timeline(limit=1, scope="group")
+        if not rows:
+            return
+        session_id = _clean(rows[0].get("session_id"), 180)
+        if not session_id:
+            return
+        window = await store.unsummarized_timeline_window(
+            session_id=session_id, scope="group", limit=1)
+        if int(window.get("total") or 0) <= 0:
+            # 没有新消息：记一下时间，免得每次问都去查一遍
+            self._group_summary_at = now
+            return
+        parts = session_id.split(":")
+        ctx = service.session_context_from_bridge({
+            "session_id": session_id,
+            "scope": "group",
+            "platform": _clean(parts[0], 60),
+            "user_id": "",
+            "group_id": _clean(parts[-1], 60) if len(parts) >= 3 else "",
+            "message_text": "",
+            "strict_session_only": False,
+        })
+        # 陪伴插件的 provider 超时是 25 秒，这里自己兜到 18 秒，超了就先用旧摘要。
+        result = await asyncio.wait_for(summarizer(ctx, force=True), timeout=18.0)
+        self._group_summary_at = time.time()
+        if result:
+            self.group_summary_count += 1
+            logger.info(f"[生活桥] 问到群时补总结了一段群聊：{session_id}")
 
     # ══════════════════════════════════════════
     #  对外接口（给 B站 AI Bot 用）
@@ -1219,8 +1357,6 @@ class PaopaoLifeBridge(Star):
                 },
                 top_k=max(limit * 3, 8),
             )
-            if not items:
-                return ""
             exclude = set()
             raw_exclude = self._cfg("pet_exclude_memory_types", []) or []
             if isinstance(raw_exclude, list):
@@ -1231,7 +1367,19 @@ class PaopaoLifeBridge(Star):
                 budget=max_chars,
                 limit=limit,
                 exclude_types=exclude,
-            )
+            ) if items else []
+            # 问「在干嘛」时把最近一次识屏提到最前面：语义检索挑出来的是
+            # 「说得最像的」，不是「刚刚发生的」，光靠它会把几小时前当成现在。
+            if any(hint in text for hint in ACTIVITY_HINTS):
+                fresh = self._render_items(
+                    await self._latest_pet_vision_items(limit=2, hours=12.0),
+                    allow_private_pair=bool(self.owner_qq),
+                    budget=max_chars,
+                    limit=2,
+                    exclude_types=exclude,
+                )
+                if fresh:
+                    lines = fresh + [line for line in lines if line not in fresh]
             if not lines:
                 return ""
             self.read_count += 1
@@ -1490,6 +1638,84 @@ class PaopaoLifeBridge(Star):
         logger.info("[生活桥] B站 补丁不在，已运行时接上（读：回评论时读中枢）")
         return "reply:patched"
 
+    # 手动刷 / QQ 分享只看字幕（不下载、不抽帧）：B站 插件一升级就整包覆盖，
+    # 这两段掉了就补回去。``anchor`` 对不上（作者改了那块代码）时只记日志，不动文件。
+    _BILI_FILE_PATCHES = (
+        (
+            "core/features/watch_on_request.py",
+            '                analysis_info["_force_rewatch"] = force_rewatch or removed_bad_cache\n',
+            '                analysis_info["_force_rewatch"] = force_rewatch or removed_bad_cache\n'
+            '                analysis_info["_subtitle_only"] = True  # 生活桥补丁：手动刷 / 分享只读字幕，不抽帧\n',
+            'analysis_info["_subtitle_only"] = True',
+        ),
+        (
+            "core/domain/video_watch.py",
+            '        joint = None\n'
+            '        if str(self.settings.get("VIDEO_VISUAL_ANALYSIS_POLICY")) != "always":\n',
+            '        if bool(video_info.pop("_subtitle_only", False)):\n'
+            '            joint = await self._build_joint_context(video_info)\n'
+            '            if not joint.get("subtitle"):\n'
+            '                media_failure(video_info, "subtitles", "手动看片只读字幕，没有取得可用字幕", self.config)\n'
+            '            video_info["analysis_basis"] = "subtitles" if joint.get("subtitle") else "metadata"\n'
+            '            return await self._analyze_video_text(video_info, joint=joint)\n'
+            '        joint = None\n'
+            '        if str(self.settings.get("VIDEO_VISUAL_ANALYSIS_POLICY")) != "always":\n',
+            'video_info.pop("_subtitle_only", False)',
+        ),
+    )
+
+    def _ensure_bili_file_patch(self) -> tuple[str, bool]:
+        """检查「手动刷只读字幕」的文件补丁，掉了就写回去。返回 (状态, 是否改过文件)。"""
+        base = Path(__file__).resolve().parent.parent / "astrbot_plugin_bilibili_ai_bot"
+        if not base.is_dir():
+            return "file:missing", False
+        changed = False
+        notes: list[str] = []
+        for rel, anchor, patched, marker in self._BILI_FILE_PATCHES:
+            path = base / rel
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                notes.append(f"{rel}:read-fail")
+                continue
+            if marker in text:
+                continue
+            if text.count(anchor) != 1:
+                notes.append(f"{rel}:anchor-missing")
+                continue
+            try:
+                path.write_text(text.replace(anchor, patched, 1), encoding="utf-8")
+            except OSError:
+                notes.append(f"{rel}:write-fail")
+                continue
+            changed = True
+            logger.info("[生活桥] B站 文件补丁掉了，已写回：%s", rel)
+        if changed:
+            return "file:patched", True
+        if notes:
+            return "file:skip(" + ",".join(notes) + ")", False
+        return "file:ok", False
+
+    async def _reload_bili_star(self) -> bool:
+        """文件补丁写回后要重载 B站 插件才生效；拿不到管理器就等下次重启。"""
+        manager = getattr(self.context, "_star_manager", None)
+        if manager is None:
+            logger.warning("[生活桥] B站 文件补丁已写回，但拿不到插件管理器，下次重启生效")
+            return False
+        try:
+            result = await manager.reload("astrbot_plugin_bilibili_ai_bot")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[生活桥] B站 插件重载失败：{exc}（补丁已写回，下次重启生效）")
+            return False
+        ok, err = True, ""
+        if isinstance(result, tuple) and len(result) >= 2:
+            ok, err = bool(result[0]), str(result[1] or "")
+        if ok:
+            logger.info("[生活桥] B站 插件已重载，手动刷只读字幕补丁生效")
+            return True
+        logger.warning(f"[生活桥] B站 插件重载失败：{err}（补丁已写回，下次重启生效）")
+        return False
+
     async def _install_bili_bridge_patch(self) -> bool:
         """给 B站 AI Bot 打运行时补丁。返回 True 表示插件已加载、检查过了。"""
         star = self._bili_star()
@@ -1499,6 +1725,14 @@ class PaopaoLifeBridge(Star):
         if bot is None:
             return False
         parts: list[str] = []
+        file_status, file_changed = self._ensure_bili_file_patch()
+        parts.append(file_status)
+        if file_changed:
+            # 补丁写回后插件跑的还是旧代码，重载一次；重载完下一轮再打运行时补丁
+            self._bili_patch_status = "+".join(parts)
+            logger.info("[LifeBridge] B站 文件补丁：%s（重载中）", file_status)
+            await self._reload_bili_star()
+            return True
         writer = getattr(bot, "memory_writer", None)
         if writer is not None:
             parts.append(self._patch_memory_writer(writer))

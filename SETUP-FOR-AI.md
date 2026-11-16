@@ -463,7 +463,7 @@ B站 AI Bot 每升级一次，就会把「和中枢互通」的两处补丁整�
 踩过两次，症状一模一样：B站 那边突然不记得 QQ 的事、看了什么也不进中枢，
 **而且一声不响** —— 自检还显示 `companion=ok`，因为桥自己没问题，是被接的那头断了。
 
-改文件没用：下次升级又冲掉，还得再手工打一遍。
+改文件会跟着一起被冲掉，所以要换个地方下手：**改内存里的类，不碰文件。**
 
 ### 12.2 做法：改内存里的类，不碰文件
 
@@ -513,16 +513,124 @@ B站 AI Bot 每升级一次，就会把「和中枢互通」的两处补丁整�
 
 也就是说：**即使源文件一个补丁都没有，桥也照样通。**
 
-### 12.6 但文件补丁还是建议留一份
+### 12.6 文件补丁也归它管了（1.4.3 起）
 
-守卫只在生活桥活着的时候有用。如果哪天生活桥被禁用、或者它自己崩了，
-B站 那边就又断了。所以：
+12.1 说「改文件没用」，是因为那两处**运行时补丁**（`_save_self_memory_record` /
+`_build_memory_context`）本来就能在内存里接，不用碰文件。
 
-- 想省事：什么都不用管，靠守卫
-- 想要双保险：把补丁也写进源文件（守卫看到 `writer:file` 就不会重复包）
+但还有另一类补丁管不到：改 B站 源码的那两处「手动刷只看字幕」——
+
+| 文件 | 改什么 |
+|---|---|
+| `core/features/watch_on_request.py` | 手动看片时给 `analysis_info` 打 `_subtitle_only` |
+| `core/domain/video_watch.py` | `_analyze_video_with_vision_inner` 看到这个标记就只走字幕，不下视频、不抽帧 |
+
+这两处是**真文件**，插件从市场升级时整个目录被覆盖，文件补丁跟着一起没。
+
+1.4.3 起守卫每 2 分钟顺带检查这两个文件：
+
+| 状态 | 含义 |
+|---|---|
+| `file:ok` | 两处都在，不用管 |
+| `file:patched` | 掉了，已写回，正在重载 B站 插件 |
+| `file:skip(...)` | 锚点对不上（作者改了那块代码），**只记日志，不动文件** |
+| `file:missing` | 找不到 B站 插件目录 |
+
+写回方式：唯一锚点 + 精确替换。锚点在文件里出现次数不是 1 就跳过，绝不瞎改。
+写完调 `context._star_manager.reload("astrbot_plugin_bilibili_ai_bot")` 重载插件，
+重载完下一轮（≤2 分钟）再把运行时补丁接上。
+
+所以升级后最迟两分钟，三层一起恢复：文件补丁写回 → 插件重载 → 运行时补丁接上。
+
+日志：
+```
+[生活桥] B站 文件补丁掉了，已写回：core/features/watch_on_request.py
+[LifeBridge] B站 文件补丁：file:patched（重载中）
+[生活桥] B站 插件已重载，手动刷只读字幕补丁生效
+```
 
 ### 12.7 加新桥的时候记得一起改
 
 守卫写死了两个目标方法的名字。以后要是再需要给 B站 插件加一层
 （比如读它的视频记忆），记得在 `_install_bili_bridge_patch()` 里补一路，
 否则那层不会有自愈能力。
+
+### 12.8 作者改了那段代码怎么办
+
+`file:skip(anchor-missing)` 不是坏了，是在说「B站 插件把这块重写了，我不敢猜」。
+这时候要做的是人肉看一眼：
+
+1. 打开 `core/domain/video_watch.py`，找到 `_analyze_video_with_vision_inner`
+2. 看 `VIDEO_VISUAL_ANALYSIS_POLICY != "always"` 那个分支还在不在
+3. 在不在都别急着改代码 —— 先确认新版本是不是**自带**了「只看字幕」的开关
+   （2.3.x 就改过这块，`_analyze_video_with_vision` 的参数都换过一次）
+4. 确认要改，再更新 `_BILI_FILE_PATCHES` 里的 `anchor` / `patched` 两段字符串
+
+只改 `_BILI_FILE_PATCHES`，别在别处加临时判断。
+
+---
+
+## 13. 群聊参考：私聊问「群里刚才聊了什么」（1.5.0 起）
+
+### 13.1 为什么会答「我看不见群里」
+
+群里说话的不是生活桥，也不是陪伴插件——是 `astrbot_plugin_group_chat_plus` 走 AstrBot 主链在回。
+陪伴插件的 `multi_host.group_targets` 一直是空的（见《群聊与插件配置》坑 1，这是故意的），
+所以**群聊根本不在陪伴插件的会话拓扑里**，私聊窗口自然「只剩咱们俩说话」。
+
+但群聊不是没被记：记忆中枢自己采群消息，按 `group_public` 写出了群摘要。
+问题只在生活桥：`_provider_read` 里那句 `_is_bili_item` 只放行 B站 来源，
+群摘要的 `source_plugin` 不是 bilibili，被整条丢掉。
+
+### 13.2 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `_provider_read` | 问句命中 `GROUP_HINTS`（群 / 群聊 / 群里 / 群友…）时，改走 `_group_reference()` |
+| `_recent_group_public()` | 新增：`store.list_memories(visibility="group_public")` 按时间倒取，不用相似度检索 |
+| `_group_reference()` | 新增：先补一次现场总结，再取摘要；拿不到新摘要就退回旧的 |
+| `_summarize_group_if_new()` | 新增：群里有未摘要的新消息时 `maybe_summarize_session(ctx, force=True)`，90 秒冷却，自身 18 秒超时 |
+| `_register_provider` | `timeout_seconds` 5.0 → **25.0**（要给 18 秒的总结留余量，平时没新消息是秒回） |
+
+为什么不用 `bridge_search` 取群摘要：群摘要的措辞高度相似（都是「某某时候群里在聊…」），
+问「群里刚才聊了什么」时按相关度永远排不进前几名。要的是**时间**，不是相似度。
+
+### 13.3 依赖的两个前提（别关）
+
+1. 中枢配置 `visibility.allow_group_public_in_private = true`（默认 false）
+2. `memory_summary.enabled = true` 且模型 provider 可用（force 时跳过 enabled 检查，但总结仍要模型）
+
+缺第 1 条：`_recent_group_public` 拿到的记忆在私聊不可见，等于没补。
+缺第 2 条：`_summarize_group_if_new` 会抛错，但会被兜住，退化成「只给旧摘要」。
+
+### 13.4 触发节奏（别调太勤，烧 token）
+
+- 群里有**未摘要**消息才总结；没有就只查一次，什么都不调
+- 同一进程内 **90 秒**冷却
+- 单次最多等 **18 秒**，超时用旧摘要，本次回复照常
+
+群聊的**定时**摘要门槛是 50 条（`memory_summary.group_trigger_event_count`，见《跨端同人化》第 4 节），
+不活跃的群要等很久才有一段自动摘要——所以才有这个「问到才补」的通道。
+
+### 13.5 验证
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:9889/health
+```
+
+看两个字段：
+
+| 字段 | 期望 |
+|---|---|
+| `reads` | 私聊问过之后 > 0（原来一直是 0，因为群摘要全被过滤） |
+| `group_summary_count` | 问到群且群里确实有新消息后 +1 |
+
+然后 QQ 私聊直接问「刚才群里聊了什么」，应该能说出群里最近的原话（不是「我看不见」）。
+
+### 13.6 回退
+
+```powershell
+Copy-Item "main.py.bak-paopao-20261116-210504" "main.py" -Force
+```
+
+重载插件即可。回退后只是「私聊看不到群」，不影响别的通道。
