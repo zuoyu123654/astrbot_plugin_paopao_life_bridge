@@ -180,6 +180,8 @@ class PaopaoLifeBridge(Star):
         # 群聊参考：问到群时，如果群里还有没被定时摘要的新消息，当场补一次
         self._group_summary_at: float = 0.0
         self.group_summary_count: int = 0
+        # 群话题窗口：命中「群」之后 10 分钟内继续问，也算在聊群
+        self._group_topic_until: float = 0.0
 
     # ══════════════════════════════════════════
     #  配置
@@ -484,7 +486,7 @@ class PaopaoLifeBridge(Star):
             # 问「群里刚才聊了什么」时补最近的群公开摘要。中枢里这些摘要是
             # visibility=group_public，私聊本来就允许读，但按相似度检索基本排不进前几名；
             # 群里还有没总结的新消息时，这里会先当场补一段（见 _group_reference）。
-            if any(hint in query for hint in GROUP_HINTS):
+            if self._group_topic(query):
                 for item in await self._group_reference(limit=2, hours=24.0):
                     content = _clean(item.get("content"), 500)
                     if not content:
@@ -606,6 +608,20 @@ class PaopaoLifeBridge(Star):
             })
         candidates.sort(key=lambda item: item.get("occurred_at") or "", reverse=True)
         return candidates[:limit]
+
+    def _group_topic(self, query: str) -> bool:
+        """这一轮要不要带群聊记录。
+
+        只在句子里出现「群」字太窄：她说「现在能看见吗？」接着问群的事，就漏了。
+        所以命中群词后开一个 10 分钟的话题窗口，窗口里继续问、少字追问都算群相关。
+        ``always_include_group_timeline`` 打开则每轮都带（会多花 token，默认关）。
+        """
+        if self._bool("always_include_group_timeline", False):
+            return True
+        if any(hint in query for hint in GROUP_HINTS):
+            self._group_topic_until = time.time() + 600
+            return True
+        return time.time() < self._group_topic_until
 
     async def _recent_group_timeline(self, *, limit: int = 30, max_chars: int = 900) -> dict[str, Any] | None:
         """群里最近 N 条原话（只取不存，直接读中枢的 timeline）。
