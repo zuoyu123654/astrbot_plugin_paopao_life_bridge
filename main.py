@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.3"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -597,7 +597,8 @@ class PaopaoLifeBridge(Star):
                 pass
             candidates.append({
                 "id": _clean(getattr(record, "id", ""), 120),
-                "content": content,
+                # 带上来源，别让她把群摘要当成自己的日记，答「群我这边看不见」
+                "content": "【群聊摘要】" + content,
                 "occurred_at": stamp,
                 "memory_type": str(getattr(record, "memory_type", "") or ""),
                 "visibility": "group_public",
@@ -606,23 +607,74 @@ class PaopaoLifeBridge(Star):
         candidates.sort(key=lambda item: item.get("occurred_at") or "", reverse=True)
         return candidates[:limit]
 
+    async def _recent_group_timeline(self, *, limit: int = 30, max_chars: int = 900) -> dict[str, Any] | None:
+        """群里最近 N 条原话（只取不存，直接读中枢的 timeline）。
+
+        老大要的是「最新聊天记录」而不是二手摘要：摘要只有几句概括，问细节还是答不上。
+        这里按发生过的时间取最近 30 条，从最新往前塞到预算满，再按时间顺序拼好。
+        发言人不做身份解析（timeline 只有 id），统一标「群友」/「她」。
+        """
+        service = self._memory_service()
+        store = getattr(service, "store", None) if service is not None else None
+        if store is None:
+            return None
+        try:
+            rows = await store.recent_timeline(limit=max(1, int(limit)), scope="group")
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"recent_group_timeline: {exc}"
+            logger.warning(f"[生活桥] 读群聊时间线失败：{exc}")
+            return None
+        if not rows:
+            return None
+        picked: list[str] = []
+        used = 0
+        newest_stamp = ""
+        for row in rows:                      # recent_timeline 是倒序，最新在前
+            text = _clean(row.get("content"), 80)
+            if not text:
+                continue
+            who = "她" if str(row.get("event_type") or "") == "bot_response" else "群友"
+            stamp = _clean(row.get("occurred_at"), 40)
+            clock = stamp[11:16] if len(stamp) >= 16 else ""
+            line = f"{clock} {who}：{text}" if clock else f"{who}：{text}"
+            if used + len(line) > max_chars and picked:
+                break
+            picked.append(line)
+            used += len(line)
+            newest_stamp = newest_stamp or stamp
+        if not picked:
+            return None
+        lines = list(reversed(picked))        # 输出按时间正序，像聊天记录
+        return {
+            "id": "group-timeline",
+            "content": "【群聊最近记录】\n" + "\n".join(lines),
+            "occurred_at": newest_stamp,
+            "memory_type": "group_timeline",
+            "visibility": "group_public",
+            "source": "qq_group",
+        }
+
     async def _group_reference(self, *, limit: int = 2, hours: float = 24.0) -> list[dict[str, Any]]:
-        """问到群时给的参考：先补一次现场总结，再取最近的群公开摘要。
+        """问到群时给的参考：最近 30 条原话 + 摘要。
 
         群聊的定时摘要门槛默认 50 条，群不活跃时要等很久才有一段；所以只要
         群里还有没被配进摘要的新消息，这里先当场总结一次（最多等 18 秒），
         拿不到新摘要也不会让本次回复失败——照旧返回已有的那几条。
         """
+        timeline = await self._recent_group_timeline(limit=30)
         items = await self._recent_group_public(limit=limit, hours=hours)
         try:
             await self._summarize_group_if_new()
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[生活桥] 群聊补总结失败，用已有摘要：{exc}")
-            return items
-        if self._group_summary_at <= 0:
-            return items
-        fresh = await self._recent_group_public(limit=limit, hours=hours)
-        return fresh or items
+        else:
+            if self._group_summary_at > 0:
+                fresh = await self._recent_group_public(limit=limit, hours=hours)
+                items = fresh or items
+        if timeline is not None:
+            # 原话放最前面：问细节时它比摘要管用
+            items.insert(0, timeline)
+        return items
 
     async def _summarize_group_if_new(self) -> None:
         """群里有未摘要的新消息就 force 总结一次；90 秒内不重复。"""
