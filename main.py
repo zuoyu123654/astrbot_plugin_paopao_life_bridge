@@ -33,7 +33,7 @@ import hashlib
 import inspect
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover
     web = None
 
 PLUGIN_NAME = "paopao_life_bridge"
-PLUGIN_VERSION = "1.5.3"
+PLUGIN_VERSION = "1.5.4"
 
 COMPANION_PLUGIN = "astrbot_plugin_private_companion"
 MEMORY_PLUGIN = "astrbot_plugin_memory_companion"
@@ -447,6 +447,23 @@ class PaopaoLifeBridge(Star):
                 return {"items": []}
             limit = min(int(request.get("limit") or 3), self._int("qq_recall_top_k", 3, 1, 10))
             max_chars = int(request.get("max_chars") or 600)
+            # 「今天/昨天干了什么」：别再靠语义检索挑两三条，直接把那一天的桌面时间线
+            # 给她（分游戏/番剧/直播/视频）。这条要排在 B站 旧事前面，不然预算被占了。
+            if self._recap_requested(query) and self._bool("enable_pet_recall", True):
+                block = await self._day_recap_block(
+                    query, budget=max(400, min(max_chars, 900)))
+                if block:
+                    self.read_count += 1
+                    self.last_read_at = time.time()
+                    # 这句不挂在 debug 上：复盘是低频事件，留着好让老大在
+                    # D:\app1\logs\astrbot.log 里对一下「她到底拿没拿到时间线」。
+                    logger.info(f"[生活桥] QQ 追问复盘 → 给了 {len(block)} 字桌面时间线")
+                    return {"items": [{
+                        "id": "pet:day-recap",
+                        "content": block,
+                        "occurred_at": datetime.now().isoformat(),
+                        "source": "desktop_pet",
+                    }]}
             items = await service.bridge_search(
                 query,
                 session_context=self._bili_context(scope="private", user_id=self.owner_qq, target="qq"),
@@ -559,6 +576,231 @@ class PaopaoLifeBridge(Star):
     async def _recent_pet_vision(self, *, limit: int = 2, hours: float = 6.0) -> list[dict[str, Any]]:
         """最近她在桌面上看到的（识屏摘要）。给 QQ 私聊补「我在干嘛」用。"""
         return await self._latest_pet_vision_items(limit=limit, hours=hours)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  「我今天/昨天干了什么」→ 桌面时间线（2026-11-18 加）
+    #
+    #  为什么单独做一条路：识屏摘要的措辞几乎一模一样（全是「老大正在…」），
+    #  语义检索对「我今天干了什么」这种短问句会挑中日记/B站旧事（实测），
+    #  而且就算挑中也只给 1~2 条，答不出「玩了哪些游戏、看了哪些直播/视频/番」。
+    #  这里改成**按日期**把她那天的识屏摘要全取回来，按 游戏/番剧/直播/视频/其它
+    #  分桶、按名称去重，压成一段「只按这些答」的时间线，直接塞进 QQ 的召回结果。
+    # ══════════════════════════════════════════════════════════════════
+
+    RECAP_DAY_WORDS = ("今天", "今日", "今儿", "昨天", "昨日", "昨晚", "今早")
+    RECAP_ACT_WORDS = ("干了什么", "干了啥", "做了什么", "做了啥", "玩了什么", "玩了啥",
+                       "看了什么", "看了啥", "都干嘛", "都在忙", "忙了什么", "回顾", "复盘",
+                       "玩啥", "看啥", "干啥", "都干了", "都做了", "都看了", "都玩了")
+    #: 「其它在忙的」按这几个关键字收敛，一件活只留一句
+    RECAP_OTHER_TOPICS = (
+        ("GPT-SoVITS", "改 GPT-SoVITS 语音"),
+        ("首句流式", "改 GPT-SoVITS 语音"),
+        ("DeepSeek Harness", "在 DSH 里干活"),
+        ("OBS", "调 OBS 画面"),
+        ("直播姬", "弄直播姬"),
+        ("桌宠", "调桌宠"),
+        ("AstrBot", "弄 AstrBot"),
+        ("QQ", "看 QQ"),
+        ("B站", "刷 B站"),
+        ("Edge", "刷网页"),
+    )
+
+    def _recap_requested(self, query: str) -> bool:
+        q = str(query or "")
+        if not q:
+            return False
+        if any(w in q for w in ("回顾", "复盘", "总结一下今天", "总结下今天")):
+            return True
+        return (any(w in q for w in self.RECAP_DAY_WORDS)
+                and any(w in q for w in self.RECAP_ACT_WORDS))
+
+    def _recap_window(self, query: str) -> tuple[datetime, datetime, str]:
+        now = datetime.now()
+        if any(w in query for w in ("昨天", "昨日", "昨晚")):
+            start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return start, start + timedelta(days=1), "昨天"
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start, now, "今天"
+
+    @staticmethod
+    def _recap_first_sentence(content: str) -> str:
+        """摘要把「老大正在做什么」写在第一句，取它就是最省事的结构化信息。"""
+        body = re.sub(r"^【[^】]*】", "", str(content or "").strip())
+        body = re.sub(r"^\s*[-•]\s*", "", body)
+        parts = re.split(r"[。\n]", body, maxsplit=1)
+        return (parts[0] if parts else body).strip()
+
+    @staticmethod
+    def _recap_quoted(text: str) -> str:
+        for pat in (r"《([^》]{1,60})》", r"[「『]([^」』]{1,60})[」』]",
+                    r"[“\"]([^”\"]{1,60})[”\"]"):
+            m = re.search(pat, text)
+            if m:
+                return m.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _recap_live_name(sentence: str, quoted: str) -> str:
+        """「在看直播」→ 主播名；不是真在看直播就返回空串（交给别的桶）。
+
+        要区分「看直播」和「用直播姬准备直播画面」「整理直播捕获」——
+        后者归到「其它」，否则复盘里会冒出一堆「看了哔哩哔哩直播姬的直播」。
+        """
+        platform = ("哔哩哔哩", "bilibili", "b站", "b 站", "直播平台",
+                    "直播姬", "直播页面", "直播小窗", "直播间", "直播间的")
+        m = re.search(r"看\s*([^，。]{2,40}?)(?:的)?直播", str(sentence or ""))
+        cand = ""
+        if m:
+            cand = m.group(1).strip()
+            cand = re.sub(r"^(在|用|开|着|把)+", "", cand).strip(" 「」“”《》")
+            # "Yommyko——那个粉白双马尾…" 这种，只留名字
+            cand = re.split(r"[—]{1,2}|（|\(|，|,|\s{2,}", cand)[0].strip()
+        if cand and len(cand) <= 24 and not any(w in cand.lower() for w in platform):
+            return cand
+        if quoted:
+            segs = [x.strip() for x in re.split(r"\s*[-|｜]\s*", quoted) if x.strip()]
+            segs = [x for x in segs if not any(w in x.lower() for w in platform)]
+            if segs:
+                return segs[-1][:24]
+        return ""
+
+    def _recap_other_label(self, sentence: str) -> str:
+        """「其它在忙的」：按关键字收敛成一句，别把整段第一句塞进去。"""
+        s = str(sentence or "")
+        low = s.lower()
+        for kw, label in self.RECAP_OTHER_TOPICS:
+            if kw.lower() in low:
+                return label
+        text = re.sub(r"^老大正在", "", s)
+        text = re.sub(r"^(用|在|改|解决|折腾|翻|调|开|盯着|看)\s*", "", text).strip("。 ")
+        text = re.sub(r"[，,].*$", "", text)
+        return text[:18]
+
+    def _recap_action(self, sentence: str, quoted: str = "") -> str:
+        """「老大正在」后面那一小段动作（到一个逗号/句号为止），用来判类型。
+
+        先把书名/引号里的片名替换掉再切——片名里常带「，」，不替换会把动作切碎。
+        """
+        body = re.sub(r"^老大正在", "", str(sentence or ""))
+        if quoted:
+            body = body.replace(quoted, "〈片名〉")
+        return re.split(r"[，,。；;]", body, maxsplit=1)[0].strip()
+
+    def _recap_classify(self, sentence: str) -> tuple[str, str]:
+        """第一句 → (桶, 名称)。宁可归到「其它」也别瞎猜。"""
+        s = str(sentence or "").strip()
+        quoted = self._recap_quoted(s)
+        act = self._recap_action(s, quoted)
+        if "直播" in act:
+            if any(k in act for k in ("看", "挂着", "开着")):
+                return "live", (self._recap_live_name(s, quoted) or quoted or "直播")
+            return "other", self._recap_other_label(self._recap_action(s))
+        if "番剧" in act or re.search(r"第\s*\d+\s*[集话]", act) or ("番" in act and quoted):
+            return "anime", (quoted or act)[:40]
+        if any(k in act for k in ("视频", "短片", "MV", "PV", "切片", "录播", "动画")):
+            return "video", (quoted or act)[:40]
+        if quoted and any(k in act for k in ("玩", "游戏", "对局", "开黑", "打")):
+            return "game", quoted[:40]
+        return "other", self._recap_other_label(self._recap_action(s))
+
+    @staticmethod
+    def _recap_clean_name(name: str) -> str:
+        """名字收尾：切掉半截引号/平台尾巴，去掉「看一个讲」这种动词头。"""
+        t = str(name or "").strip()
+        t = re.split(r"[」』]", t)[0].strip()
+        t = re.sub(r"的二次元弹幕.*$", "", t)
+        t = re.sub(r"^(看一个|看|标题为|一个|用\s*Microsoft\s*Edge\s*|用\s*Edge\s*)", "", t)
+        return t.strip(" 「」“”《》").strip()
+
+    @staticmethod
+    def _recap_name_ok(name: str) -> bool:
+        if len(name) < 2:
+            return False
+        if name in ("直播", "视频", "看视频", "在看"):
+            return False
+        if "二次元弹幕" in name:
+            return False
+        return True
+
+    async def _day_recap_block(self, query: str, *, budget: int = 700) -> str:
+        """按日期取她那天的识屏摘要，压成一段可分桶回答的时间线。"""
+        service = self._memory_service()
+        store = getattr(service, "store", None) if service is not None else None
+        if store is None:
+            return ""
+        start, end, label = self._recap_window(query)
+        try:
+            records = await store.list_memories(memory_type="pet_vision_digest", limit=600)
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"day_recap: {exc}"
+            logger.warning(f"[生活桥] 读识屏摘要失败（复盘）：{exc}")
+            return ""
+        buckets: dict[str, list[tuple[datetime, str]]] = {
+            "game": [], "anime": [], "live": [], "video": [], "other": [],
+        }
+        seen: set[tuple[str, str]] = set()
+        seen_times: list[datetime] = []
+        for record in records or []:
+            stamp = _clean(getattr(record, "occurred_at", ""), 40)
+            try:
+                at = datetime.fromisoformat(stamp.replace("Z", "+00:00")).replace(tzinfo=None)
+            except (TypeError, ValueError):
+                continue
+            if not (start <= at <= end):
+                continue
+            content = _clean(getattr(record, "content", ""), 600)
+            if not content:
+                continue
+            first = self._recap_first_sentence(content)
+            if not first:
+                continue
+            kind, name = self._recap_classify(first)
+            key = (kind, re.sub(r"[\s《》「」“”\"'·:：,，。!！?？\-—_]", "", name)[:14])
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            buckets[kind].append((at, name.strip()))
+            seen_times.append(at)
+        if not seen_times:
+            return ""
+        caps = {"game": 6, "anime": 3, "live": 5, "video": 5, "other": 3}
+        titles = {"game": "玩的游戏", "anime": "看的番", "live": "看的直播",
+                  "video": "看的视频", "other": "其它在忙的"}
+        first_at, last_at = min(seen_times), max(seen_times)
+        head = (f"【{label}（{first_at:%m-%d %H:%M}–{last_at:%H:%M}）桌面上干过的事】"
+                "这些都是她真的看到过的，只按这些答，别编：")
+        lines = [head]
+        used = len(head)
+        said: set[str] = set()
+        for kind in ("game", "anime", "live", "video", "other"):
+            items = buckets[kind]
+            if not items:
+                continue
+            items.sort(key=lambda x: x[0])
+            picked: list[str] = []
+            for at, name in items:
+                clean_name = self._recap_clean_name(name)
+                if not self._recap_name_ok(clean_name):
+                    continue
+                key = re.sub(r"[\s《》「」“”\"'·:：,，。!！?？\-—_]", "", clean_name)[:12]
+                if not key or key in said:
+                    continue
+                said.add(key)
+                picked.append(f"{clean_name[:26]}（{at:%H:%M}）")
+                if len(picked) >= caps[kind]:
+                    break
+            if not picked:
+                continue
+            line = f"{titles[kind]}：" + "、".join(picked)
+            if used + len(line) > budget:
+                break
+            lines.append(line)
+            used += len(line)
+        if len(lines) <= 1:
+            return ""
+        lines.append("问「玩了什么」就报游戏名，问「看了什么」就报番剧/直播/视频名；不确定的就别说。")
+        return "\n".join(lines)
+
 
     async def _recent_group_public(self, *, limit: int = 2, hours: float = 24.0) -> list[dict[str, Any]]:
         """按时间倒序取最近的群公开摘要（visibility=group_public）。
@@ -1407,6 +1649,15 @@ class PaopaoLifeBridge(Star):
         if service is None:
             return ""
         text = _clean(query, 600) or "今天"
+        # 「今天/昨天干了什么」：按日期给她一段分桶的时间线（游戏/番剧/直播/视频），
+        # 比语义检索稳。桌宠、DSH、命令行都走这条路。
+        if self._recap_requested(text):
+            block = await self._day_recap_block(text, budget=max(400, min(max_chars, 900)))
+            if block:
+                self.read_count += 1
+                self.last_read_at = time.time()
+                logger.info(f"[生活桥] {platform} 追问复盘 → 给了 {len(block)} 字桌面时间线")
+                return block
         # 「我在干嘛」这种短问句，只靠两个字匹配不到「老大正在玩…」，放宽一点再查
         search_text = text
         if len(text) <= 14 or any(hint in text for hint in ACTIVITY_HINTS):
